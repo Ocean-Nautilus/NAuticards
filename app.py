@@ -4,10 +4,12 @@ import json
 import re
 import uuid
 import time
+import sqlite3
+import secrets
 from datetime import date
 
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
@@ -44,6 +46,34 @@ MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 МБ
 _usage_stats = {"date": str(date.today()), "count": 0}
 
 _token_cache = {"access_token": None, "expires_at": 0}
+
+# ============================================================
+# ХРАНИЛИЩЕ ДЛЯ РАСШАРИВАЕМЫХ НАБОРОВ КАРТОЧЕК (SQLite)
+# ============================================================
+# ВАЖНО: на бесплатном тарифе Render диск не постоянный — файл базы
+# может обнулиться при перезапуске/передеплое сервиса. Для теста на
+# группе этого достаточно; для долгосрочного хранения ссылок в будущем
+# потребуется подключить постоянную БД (например, Render Postgres).
+DB_PATH = os.path.join(os.path.dirname(__file__), "cards.db")
+
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS card_sets (
+            id TEXT PRIMARY KEY,
+            cards_json TEXT NOT NULL,
+            title TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+init_db()
 
 
 def get_gigachat_token() -> str:
@@ -127,10 +157,13 @@ def ask_gigachat(prompt: str) -> str:
             detail=f"Ошибка запроса к GigaChat: {resp.status_code} {resp.text}",
         )
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    choice = data["choices"][0]
+    content = choice["message"]["content"]
+    finish_reason = choice.get("finish_reason", "unknown")
+    return content, finish_reason
 
 
-def extract_json(raw_text: str):
+def extract_json(raw_text: str, finish_reason: str = "unknown"):
     """GigaChat иногда оборачивает ответ в ```json ... ``` — чистим и парсим.
     Модель иногда путает формат и вместо массива [] возвращает объект {}
     с ключами "0", "1", "2"... — приводим оба варианта к единому списку.
@@ -162,10 +195,14 @@ def extract_json(raw_text: str):
         try:
             parsed = json.loads(repaired, strict=False)
         except json.JSONDecodeError as e:
+            if finish_reason == "length":
+                reason_hint = "Не хватило max_tokens — ответ обрезан по лимиту длины."
+            else:
+                reason_hint = f"Модель завершила ответ некорректно (finish_reason: {finish_reason})."
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    f"Ответ от модели обрезан и не удалось восстановить: {e}. "
+                    f"Ответ от модели повреждён и не удалось восстановить: {e}. {reason_hint} "
                     f"Сырой ответ: {raw_text[:500]}"
                 ),
             )
@@ -236,8 +273,10 @@ def build_prompt(source_text: str, level: str = "detailed") -> str:
         "символа [ и заканчивается символом ]), а НЕ объект с ключами-номерами "
         '(НЕ { "0": ..., "1": ... }). Каждый элемент массива — это объект в '
         "фигурных скобках {}, а не строка в кавычках.\n\n"
-        "Сделай от 5 до 15 карточек в зависимости от объёма материала. "
-        "Не добавляй ничего, кроме самого JSON-массива.\n\n"
+        "Сделай от 5 до 12 карточек в зависимости от объёма материала. "
+        "Не добавляй ничего, кроме самого JSON-массива. Не форматируй JSON "
+        "с отступами и переносами строк — верни компактную запись в одну строку, "
+        "это экономит место в ответе.\n\n"
         f"Текст лекции:\n{trimmed}"
     )
 
@@ -273,8 +312,8 @@ async def generate_cards(
     was_truncated = len(source_text) > MAX_INPUT_CHARS
 
     prompt = build_prompt(source_text, level=level)
-    raw_response = ask_gigachat(prompt)
-    cards = extract_json(raw_response)
+    raw_response, finish_reason = ask_gigachat(prompt)
+    cards = extract_json(raw_response, finish_reason)
 
     today = str(date.today())
     if _usage_stats["date"] != today:
@@ -296,6 +335,49 @@ async def get_limits():
         "max_input_chars": MAX_INPUT_CHARS,
         "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
     })
+
+
+@app.post("/api/save-set")
+async def save_set(payload: dict = Body(...)):
+    """Сохраняет набор сгенерированных карточек и возвращает короткую
+    ссылку, по которой их можно посмотреть без повторной генерации."""
+    cards = payload.get("cards")
+    title = payload.get("title", "Набор карточек")
+
+    if not cards or not isinstance(cards, list):
+        raise HTTPException(status_code=400, detail="Нет карточек для сохранения")
+
+    set_id = secrets.token_urlsafe(5)  # короткий читаемый ID, например "aB3xQ9"
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO card_sets (id, cards_json, title, created_at) VALUES (?, ?, ?, ?)",
+        (set_id, json.dumps(cards, ensure_ascii=False), title, str(date.today())),
+    )
+    conn.commit()
+    conn.close()
+
+    return JSONResponse({"id": set_id, "url": f"/s/{set_id}"})
+
+
+@app.get("/api/set/{set_id}")
+async def get_set(set_id: str):
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT cards_json, title FROM card_sets WHERE id = ?", (set_id,)
+    ).fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Набор карточек не найден (возможно, ссылка устарела)")
+
+    cards_json, title = row
+    return JSONResponse({"cards": json.loads(cards_json), "title": title})
+
+
+@app.get("/s/{set_id}")
+async def view_shared_set(set_id: str):
+    return FileResponse(os.path.join("static", "shared.html"))
 
 
 @app.get("/api/stats")

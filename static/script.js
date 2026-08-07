@@ -1,4 +1,27 @@
 // ============================================================
+// СБРОС ФАЙЛА ПРИ ЗАГРУЗКЕ СТРАНИЦЫ
+// ============================================================
+// Некоторые браузеры (особенно Firefox) при обновлении страницы (F5)
+// восстанавливают старое состояние формы, включая выбранный файл — но
+// наша кастомная надпись в зоне загрузки на это не реагирует, и
+// получается рассинхрон: файл незаметно остаётся выбранным, хотя
+// визуально это не видно. Чтобы не было "невидимого" старого файла —
+// принудительно сбрасываем инпут при каждой загрузке страницы.
+window.addEventListener("pageshow", () => {
+  const fileInputEl = document.getElementById("fileInput");
+  const fileDropEl = document.getElementById("fileDrop");
+  if (fileInputEl) fileInputEl.value = "";
+  if (fileDropEl) {
+    fileDropEl.innerHTML = `
+      <span class="drop-icon">📎</span>
+      <span>Перетащи файл сюда или нажми, чтобы выбрать</span>
+      <span style="font-size:11px; opacity:.7">.txt, .pdf, .docx, .pptx</span>
+    `;
+    fileDropEl.classList.remove("has-file");
+  }
+});
+
+// ============================================================
 // ЛИМИТЫ — подтягиваем с бэкенда, чтобы не дублировать числа
 // ============================================================
 let MAX_INPUT_CHARS = 15000;
@@ -103,6 +126,23 @@ updateCharCounter();
 const cardsEl = document.getElementById("cards");
 const emptyHint = document.getElementById("emptyHint");
 
+function cardToText(card){
+  return `${card.title || ""}\n\nВопрос: ${card.question || ""}\nОтвет: ${card.answer || ""}\n`;
+}
+
+function downloadCardsAsText(cards, filename = "карточки.txt"){
+  const content = cards.map(cardToText).join("\n---\n\n");
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function renderCards(cards){
   cardsEl.innerHTML = "";
   if (!cards || cards.length === 0){
@@ -117,6 +157,7 @@ function renderCards(cards){
     const tags = (card.tags || []).map(t => `<span class="tag">${t}</span>`).join("");
 
     el.innerHTML = `
+      <button class="copy-btn" title="Скопировать карточку">📋</button>
       <div class="tag-row">${tags}</div>
       <h3>${card.title || ""}</h3>
       <div class="q">${card.question || ""}</div>
@@ -129,9 +170,73 @@ function renderCards(cards){
       answerEl.classList.toggle("revealed");
     });
 
+    // Копирование — отдельная кнопка, клик по ней не должен раскрывать ответ
+    const copyBtn = el.querySelector(".copy-btn");
+    copyBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(cardToText(card));
+      copyBtn.textContent = "✅";
+      copyBtn.classList.add("copied");
+      setTimeout(() => {
+        copyBtn.textContent = "📋";
+        copyBtn.classList.remove("copied");
+      }, 1200);
+    });
+
     cardsEl.appendChild(el);
   });
 }
+
+// ============================================================
+// КНОПКА "ПОДЕЛИТЬСЯ ССЫЛКОЙ"
+// ============================================================
+const shareBox = document.getElementById("shareBox");
+const shareBtn = document.getElementById("shareBtn");
+const shareLinkRow = document.getElementById("shareLinkRow");
+const shareLinkInput = document.getElementById("shareLinkInput");
+const copyLinkBtn = document.getElementById("copyLinkBtn");
+
+let lastGeneratedCards = null;
+
+shareBtn.addEventListener("click", async () => {
+  if (!lastGeneratedCards) return;
+
+  shareBtn.disabled = true;
+  shareBtn.textContent = "Сохраняю...";
+
+  try {
+    const res = await fetch("/api/save-set", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ cards: lastGeneratedCards, title: "Набор карточек" }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Не удалось сохранить");
+
+    const fullUrl = window.location.origin + data.url;
+    shareLinkInput.value = fullUrl;
+    shareLinkRow.style.display = "flex";
+    shareBtn.textContent = "🔗 Поделиться ссылкой";
+  } catch (err) {
+    setStatus("Не удалось создать ссылку: " + err.message, true);
+    shareBtn.textContent = "🔗 Поделиться ссылкой";
+  } finally {
+    shareBtn.disabled = false;
+  }
+});
+
+copyLinkBtn.addEventListener("click", () => {
+  shareLinkInput.select();
+  navigator.clipboard.writeText(shareLinkInput.value);
+  copyLinkBtn.textContent = "Скопировано!";
+  setTimeout(() => { copyLinkBtn.textContent = "Копировать"; }, 1500);
+});
+
+const downloadBtn = document.getElementById("downloadBtn");
+downloadBtn.addEventListener("click", () => {
+  if (!lastGeneratedCards) return;
+  downloadCardsAsText(lastGeneratedCards);
+});
 
 // ============================================================
 // ОТПРАВКА ЗАПРОСА НА ГЕНЕРАЦИЮ
@@ -183,6 +288,9 @@ submitBtn.addEventListener("click", async () => {
       throw new Error(data.detail || "Неизвестная ошибка");
     }
     renderCards(data.cards);
+    lastGeneratedCards = data.cards;
+    shareBox.style.display = "block";
+    shareLinkRow.style.display = "none";
     const truncNote = data.was_truncated
       ? ` (лекция длиннее лимита — обработана только первая часть)`
       : "";
