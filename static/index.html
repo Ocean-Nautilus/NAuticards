@@ -9,7 +9,10 @@
 <meta property="og:title" content="Nauticards — Лекция в карточки" />
 <meta property="og:description" content="ИИ превращает текст лекции в карточки для повторения" />
 <meta property="og:type" content="website" />
-<link rel="stylesheet" href="/static/style.css?v=4" />
+<link rel="stylesheet" href="/static/style.css?v=5" />
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script src="https://cdn.jsdelivr.net/npm/markmap-lib@0.16.1/dist/browser/index.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/markmap-view@0.16.1/dist/browser/index.js"></script>
 </head>
 <body>
 
@@ -56,10 +59,20 @@
   <div class="share-actions">
     <button class="share-btn" id="shareBtn">🔗 Поделиться ссылкой</button>
     <button class="download-btn" id="downloadBtn">⬇️ Скачать .txt</button>
+    <button class="map-btn" id="mapBtn">🗺 Карта лекции</button>
   </div>
   <div class="share-link-row" id="shareLinkRow" style="display:none">
     <input type="text" id="shareLinkInput" readonly />
     <button id="copyLinkBtn">Копировать</button>
+  </div>
+</div>
+
+<div class="modal-overlay" id="mapModal" style="display:none">
+  <div class="modal-box">
+    <button class="modal-close" id="mapModalClose">✕</button>
+    <h3>Карта лекции</h3>
+    <div id="mapLoading" class="map-loading">Строю карту...</div>
+    <svg id="mapSvg" class="map-svg"></svg>
   </div>
 </div>
 
@@ -75,6 +88,6 @@
   </a>
 </footer>
 
-<script src="/static/script.js?v=4"></script>
+<script src="/static/script.js?v=5"></script>
 </body>
 </html>

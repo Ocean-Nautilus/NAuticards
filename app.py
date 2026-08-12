@@ -40,6 +40,20 @@ MAX_INPUT_CHARS = 15000
 # закинув видео или огромный архив по ошибке.
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 МБ
 
+
+class QuotaExceeded(Exception):
+    """Внутреннее исключение: у модели закончился бесплатный баланс токенов."""
+    pass
+
+
+# Порядок моделей для разных задач — если на первой в списке кончился
+# баланс, автоматически пробуем следующую. Карточки — самая частая
+# операция, поэтому впереди Lite (у него больше всего токенов). Для
+# уточнений и карты лекции первым ставим Pro — там важнее качество ответа.
+MODELS_FOR_CARDS = ["GigaChat", "GigaChat-Pro"]
+MODELS_FOR_CLARIFY = ["GigaChat-Pro", "GigaChat"]
+MODELS_FOR_MAP = ["GigaChat-Pro", "GigaChat"]
+
 # Простой счётчик использований в памяти (сбрасывается при перезапуске
 # сервера). Для реальной статистики между перезапусками потребуется база
 # данных, но для теста на группе этого достаточно.
@@ -74,6 +88,12 @@ def init_db():
 
 
 init_db()
+
+# Временное хранилище текста последних лекций — нужно, чтобы кнопка
+# "Показать карту лекции" могла запросить карту позже, не заставляя
+# пользователя заново загружать файл. Живёт только в памяти процесса
+# (как и счётчик использований) — этого достаточно для тестового этапа.
+_recent_texts: dict[str, str] = {}
 
 
 def get_gigachat_token() -> str:
@@ -114,7 +134,8 @@ def get_gigachat_token() -> str:
     return _token_cache["access_token"]
 
 
-def ask_gigachat(prompt: str) -> str:
+def ask_gigachat(prompt: str, model: str = "GigaChat", max_tokens: int = 8000, temperature: float = 0.3):
+    """Низкоуровневый запрос к конкретной модели GigaChat."""
     token = get_gigachat_token()
     headers = {
         "Content-Type": "application/json",
@@ -122,20 +143,19 @@ def ask_gigachat(prompt: str) -> str:
         "Authorization": f"Bearer {token}",
     }
     body = {
-        "model": "GigaChat",
+        "model": model,
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "Ты помощник, который превращает текст лекций в обучающие "
-                    "карточки. Отвечай ТОЛЬКО валидным JSON-массивом, без markdown, "
-                    "без пояснений до или после."
+                    "Ты помощник, который помогает студентам разбираться в лекциях. "
+                    "Следуй формату, который просит пользователь, точно и без отступлений."
                 ),
             },
             {"role": "user", "content": prompt},
         ],
-        "temperature": 0.3,
-        "max_tokens": 8000,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
     }
 
     try:
@@ -151,6 +171,10 @@ def ask_gigachat(prompt: str) -> str:
             detail="Не удалось подключиться к серверу GigaChat. Проверь интернет-соединение и повтори попытку.",
         )
 
+    # 402/429 обычно значит "закончился баланс токенов на эту модель"
+    if resp.status_code in (402, 429):
+        raise QuotaExceeded(f"Лимит токенов исчерпан для модели {model}: {resp.status_code} {resp.text}")
+
     if resp.status_code != 200:
         raise HTTPException(
             status_code=502,
@@ -161,6 +185,23 @@ def ask_gigachat(prompt: str) -> str:
     content = choice["message"]["content"]
     finish_reason = choice.get("finish_reason", "unknown")
     return content, finish_reason
+
+
+def ask_gigachat_with_fallback(prompt: str, models: list[str], max_tokens: int = 8000, temperature: float = 0.3):
+    """Пробует модели по очереди из списка — если на текущей закончился
+    баланс токенов (QuotaExceeded), автоматически переходит к следующей.
+    Так лимит одной модели не останавливает работу приложения."""
+    last_error = None
+    for model in models:
+        try:
+            return ask_gigachat(prompt, model=model, max_tokens=max_tokens, temperature=temperature)
+        except QuotaExceeded as e:
+            last_error = e
+            continue
+    raise HTTPException(
+        status_code=402,
+        detail=f"Лимит токенов исчерпан на всех доступных моделях ({', '.join(models)}). {last_error}",
+    )
 
 
 def extract_json(raw_text: str, finish_reason: str = "unknown"):
@@ -287,6 +328,47 @@ def build_prompt(source_text: str, level: str = "detailed") -> str:
 app = FastAPI(title="Лекция -> Карточки")
 
 
+def build_map_prompt(source_text: str) -> str:
+    """Промпт для карты лекции — просим Markdown с заголовками и списками
+    (не Mermaid!), это надёжно парсится библиотекой markmap на фронтенде
+    и почти невозможно сломать по формату, в отличие от строгого
+    графового синтаксиса."""
+    trimmed = source_text[:MAX_INPUT_CHARS]
+    return (
+        "Построй структурную карту лекции ниже в виде Markdown-документа "
+        "с заголовками и вложенными списками — она станет майндмэпом.\n\n"
+        "СТРОГИЙ ФОРМАТ:\n"
+        "# Название лекции\n"
+        "## Тема 1\n"
+        "- Ключевой факт 1\n"
+        "- Ключевой факт 2\n"
+        "## Тема 2\n"
+        "- Ключевой факт\n"
+        "### Подтема\n"
+        "- Уточняющий факт\n\n"
+        "Правила: 3-7 тем верхнего уровня (##), у каждой 2-5 фактов "
+        "(пункты списка через дефис), при необходимости — подтемы (###). "
+        "Не добавляй ничего, кроме самого Markdown — без пояснений до "
+        "или после, без обёртки в блок кода ```.\n\n"
+        f"Текст лекции:\n{trimmed}"
+    )
+
+
+def build_clarify_prompt(card_question: str, card_answer: str, user_question: str) -> str:
+    """Промпт для уточняющего вопроса по конкретной карточке. Даём модели
+    только контекст этой карточки (не всю лекцию) — так дешевле и быстрее,
+    а модель отвечает по существу, не расплываясь."""
+    return (
+        "Студент изучает карточку для повторения со следующим содержимым:\n"
+        f"Вопрос карточки: {card_question}\n"
+        f"Ответ карточки: {card_answer}\n\n"
+        f"Студент задал уточняющий вопрос: {user_question}\n\n"
+        "Ответь кратко и по существу (2-4 предложения), не повторяя "
+        "дословно то, что уже написано в ответе карточки — дай именно "
+        "уточнение или объяснение сверх уже известного."
+    )
+
+
 @app.post("/api/generate-cards")
 async def generate_cards(
     file: UploadFile | None = File(default=None),
@@ -312,8 +394,13 @@ async def generate_cards(
     was_truncated = len(source_text) > MAX_INPUT_CHARS
 
     prompt = build_prompt(source_text, level=level)
-    raw_response, finish_reason = ask_gigachat(prompt)
+    raw_response, finish_reason = ask_gigachat_with_fallback(prompt, models=MODELS_FOR_CARDS)
     cards = extract_json(raw_response, finish_reason)
+
+    # Сохраняем текст лекции в памяти — понадобится, если пользователь
+    # позже нажмёт "Показать карту лекции", без повторной загрузки файла.
+    map_session_id = secrets.token_urlsafe(8)
+    _recent_texts[map_session_id] = source_text
 
     today = str(date.today())
     if _usage_stats["date"] != today:
@@ -326,6 +413,7 @@ async def generate_cards(
         "source_length": len(source_text),
         "max_input_chars": MAX_INPUT_CHARS,
         "was_truncated": was_truncated,
+        "map_session_id": map_session_id,
     })
 
 
@@ -387,6 +475,50 @@ async def get_stats():
     if _usage_stats["date"] != today:
         return JSONResponse({"date": today, "count": 0})
     return JSONResponse(_usage_stats)
+
+
+@app.post("/api/generate-map")
+async def generate_map(payload: dict = Body(...)):
+    """Строит карту лекции (Markdown-outline для рендера через markmap)
+    по тексту, сохранённому при последней генерации карточек."""
+    session_id = payload.get("map_session_id")
+    source_text = _recent_texts.get(session_id)
+
+    if not source_text:
+        raise HTTPException(
+            status_code=404,
+            detail="Текст лекции не найден (сервер мог перезапуститься, или сессия устарела). Сгенерируй карточки заново.",
+        )
+
+    prompt = build_map_prompt(source_text)
+    raw_markdown, finish_reason = ask_gigachat_with_fallback(
+        prompt, models=MODELS_FOR_MAP, max_tokens=2000
+    )
+
+    # На всякий случай чистим обёртку в блок кода, если модель её добавила
+    cleaned = raw_markdown.strip()
+    cleaned = re.sub(r"^```(markdown|md)?", "", cleaned).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+
+    return JSONResponse({"markdown": cleaned})
+
+
+@app.post("/api/clarify")
+async def clarify_card(payload: dict = Body(...)):
+    """Отвечает на уточняющий вопрос студента по конкретной карточке."""
+    card_question = payload.get("card_question", "")
+    card_answer = payload.get("card_answer", "")
+    user_question = payload.get("user_question", "")
+
+    if not user_question.strip():
+        raise HTTPException(status_code=400, detail="Вопрос пустой")
+
+    prompt = build_clarify_prompt(card_question, card_answer, user_question)
+    answer_text, _ = ask_gigachat_with_fallback(
+        prompt, models=MODELS_FOR_CLARIFY, max_tokens=500
+    )
+
+    return JSONResponse({"answer": answer_text.strip()})
 
 
 @app.get("/")

@@ -161,7 +161,16 @@ function renderCards(cards){
       <div class="tag-row">${tags}</div>
       <h3>${card.title || ""}</h3>
       <div class="q">${card.question || ""}</div>
-      <div class="a">${card.answer || ""}</div>
+      <div class="a">
+        ${card.answer || ""}
+        <div class="clarify-box">
+          <div class="clarify-history"></div>
+          <div class="clarify-input-row">
+            <input type="text" placeholder="Спросить уточнение у ИИ..." />
+            <button>Спросить</button>
+          </div>
+        </div>
+      </div>
     `;
 
     // Квиз-режим: клик в любом месте карточки раскрывает/скрывает ответ
@@ -183,9 +192,106 @@ function renderCards(cards){
       }, 1200);
     });
 
+    // Блок уточнений — клики внутри не должны закрывать карточку
+    const clarifyBox = el.querySelector(".clarify-box");
+    const clarifyHistory = el.querySelector(".clarify-history");
+    const clarifyInput = el.querySelector(".clarify-input-row input");
+    const clarifyBtn = el.querySelector(".clarify-input-row button");
+
+    clarifyBox.addEventListener("click", (e) => e.stopPropagation());
+
+    async function sendClarify(){
+      const question = clarifyInput.value.trim();
+      if (!question) return;
+
+      clarifyBtn.disabled = true;
+      clarifyBtn.textContent = "...";
+
+      try {
+        const res = await fetch("/api/clarify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            card_question: card.question || "",
+            card_answer: card.answer || "",
+            user_question: question,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.detail || "Ошибка");
+
+        const qaEl = document.createElement("div");
+        qaEl.className = "clarify-qa";
+        qaEl.innerHTML = `<div class="cq">Ты: ${question}</div><div class="ca">${data.answer}</div>`;
+        clarifyHistory.appendChild(qaEl);
+        clarifyInput.value = "";
+      } catch (err) {
+        const qaEl = document.createElement("div");
+        qaEl.className = "clarify-qa";
+        qaEl.innerHTML = `<div class="ca">Ошибка: ${err.message}</div>`;
+        clarifyHistory.appendChild(qaEl);
+      } finally {
+        clarifyBtn.disabled = false;
+        clarifyBtn.textContent = "Спросить";
+      }
+    }
+
+    clarifyBtn.addEventListener("click", sendClarify);
+    clarifyInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") sendClarify();
+    });
+
     cardsEl.appendChild(el);
   });
 }
+
+// ============================================================
+// КАРТА ЛЕКЦИИ (майндмэп через markmap)
+// ============================================================
+let currentMapSessionId = null;
+
+const mapBtn = document.getElementById("mapBtn");
+const mapModal = document.getElementById("mapModal");
+const mapModalClose = document.getElementById("mapModalClose");
+const mapLoading = document.getElementById("mapLoading");
+const mapSvg = document.getElementById("mapSvg");
+
+function closeMapModal(){
+  mapModal.style.display = "none";
+}
+
+mapModalClose.addEventListener("click", closeMapModal);
+mapModal.addEventListener("click", (e) => {
+  if (e.target === mapModal) closeMapModal();
+});
+
+mapBtn.addEventListener("click", async () => {
+  if (!currentMapSessionId) return;
+
+  mapModal.style.display = "flex";
+  mapLoading.style.display = "block";
+  mapSvg.innerHTML = "";
+
+  try {
+    const res = await fetch("/api/generate-map", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ map_session_id: currentMapSessionId }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Не удалось построить карту");
+
+    const { Transformer } = window.markmap;
+    const { Markmap } = window.markmap;
+    const transformer = new Transformer();
+    const { root } = transformer.transform(data.markdown);
+
+    mapLoading.style.display = "none";
+    Markmap.create(mapSvg, undefined, root);
+  } catch (err) {
+    mapLoading.textContent = "Ошибка: " + err.message;
+  }
+});
 
 // ============================================================
 // КНОПКА "ПОДЕЛИТЬСЯ ССЫЛКОЙ"
@@ -289,6 +395,7 @@ submitBtn.addEventListener("click", async () => {
     }
     renderCards(data.cards);
     lastGeneratedCards = data.cards;
+    currentMapSessionId = data.map_session_id;
     shareBox.style.display = "block";
     shareLinkRow.style.display = "none";
     const truncNote = data.was_truncated
