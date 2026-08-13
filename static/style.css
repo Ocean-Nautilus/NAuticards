@@ -384,6 +384,10 @@ button.submit.loading .spinner{ display:inline-block; }
 .dev-footer{
   text-align:center;
   margin-top: 60px;
+  display:flex;
+  gap:12px;
+  justify-content:center;
+  flex-wrap:wrap;
 }
 
 .dev-footer a{
@@ -402,6 +406,11 @@ button.submit.loading .spinner{ display:inline-block; }
 .dev-footer a:hover{
   color: var(--mint);
   border-color: var(--mint);
+}
+
+.support-link:hover{
+  color: var(--coral) !important;
+  border-color: var(--coral) !important;
 }
 
 .back-home-btn{
@@ -525,6 +534,19 @@ button.submit.loading .spinner{ display:inline-block; }
   flex:1;
   width:100%;
   min-height:0;
+}
+
+/* markmap по умолчанию рисует тёмный текст (рассчитан на светлый фон) —
+   принудительно делаем его светлым под нашу тёмную тему. Узлы markmap
+   рендерятся и как SVG <text>, и как HTML внутри <foreignObject>,
+   поэтому переопределяем оба варианта: fill (для SVG) и color (для HTML). */
+.map-svg text{
+  fill: var(--text) !important;
+}
+
+.map-svg foreignObject,
+.map-svg foreignObject *{
+  color: var(--text) !important;
 }
 
 /* --- Блок уточнений у ИИ на карточке --- */

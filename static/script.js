@@ -287,7 +287,8 @@ mapBtn.addEventListener("click", async () => {
     const { root } = transformer.transform(data.markdown);
 
     mapLoading.style.display = "none";
-    Markmap.create(mapSvg, undefined, root);
+    const mm = Markmap.create(mapSvg, undefined, root);
+    setTimeout(() => mm.fit(), 50);
   } catch (err) {
     mapLoading.textContent = "Ошибка: " + err.message;
   }

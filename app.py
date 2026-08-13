@@ -6,6 +6,7 @@ import uuid
 import time
 import sqlite3
 import secrets
+import asyncio
 from datetime import date
 
 import requests
@@ -53,6 +54,13 @@ class QuotaExceeded(Exception):
 MODELS_FOR_CARDS = ["GigaChat", "GigaChat-Pro"]
 MODELS_FOR_CLARIFY = ["GigaChat-Pro", "GigaChat"]
 MODELS_FOR_MAP = ["GigaChat-Pro", "GigaChat"]
+
+# Тариф GigaChat (Freemium) разрешает только 1 одновременный запрос ко
+# всему API-ключу. Если два пользователя нажмут кнопку одновременно —
+# второй запрос без этой защиты просто получит ошибку от GigaChat.
+# Семафор ставит все запросы в очередь: они выполняются по одному,
+# автоматически дожидаясь освобождения "потока", вместо падения с ошибкой.
+gigachat_semaphore = asyncio.Semaphore(1)
 
 # Простой счётчик использований в памяти (сбрасывается при перезапуске
 # сервера). Для реальной статистики между перезапусками потребуется база
@@ -394,7 +402,8 @@ async def generate_cards(
     was_truncated = len(source_text) > MAX_INPUT_CHARS
 
     prompt = build_prompt(source_text, level=level)
-    raw_response, finish_reason = ask_gigachat_with_fallback(prompt, models=MODELS_FOR_CARDS)
+    async with gigachat_semaphore:
+        raw_response, finish_reason = ask_gigachat_with_fallback(prompt, models=MODELS_FOR_CARDS)
     cards = extract_json(raw_response, finish_reason)
 
     # Сохраняем текст лекции в памяти — понадобится, если пользователь
@@ -491,9 +500,10 @@ async def generate_map(payload: dict = Body(...)):
         )
 
     prompt = build_map_prompt(source_text)
-    raw_markdown, finish_reason = ask_gigachat_with_fallback(
-        prompt, models=MODELS_FOR_MAP, max_tokens=2000
-    )
+    async with gigachat_semaphore:
+        raw_markdown, finish_reason = ask_gigachat_with_fallback(
+            prompt, models=MODELS_FOR_MAP, max_tokens=2000
+        )
 
     # На всякий случай чистим обёртку в блок кода, если модель её добавила
     cleaned = raw_markdown.strip()
@@ -514,11 +524,22 @@ async def clarify_card(payload: dict = Body(...)):
         raise HTTPException(status_code=400, detail="Вопрос пустой")
 
     prompt = build_clarify_prompt(card_question, card_answer, user_question)
-    answer_text, _ = ask_gigachat_with_fallback(
-        prompt, models=MODELS_FOR_CLARIFY, max_tokens=500
-    )
+    async with gigachat_semaphore:
+        answer_text, _ = ask_gigachat_with_fallback(
+            prompt, models=MODELS_FOR_CLARIFY, max_tokens=500
+        )
 
     return JSONResponse({"answer": answer_text.strip()})
+
+
+@app.get("/robots.txt")
+async def robots_txt():
+    return FileResponse(os.path.join("static", "robots.txt"), media_type="text/plain")
+
+
+@app.get("/sitemap.xml")
+async def sitemap_xml():
+    return FileResponse(os.path.join("static", "sitemap.xml"), media_type="application/xml")
 
 
 @app.get("/")

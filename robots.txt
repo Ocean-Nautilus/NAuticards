@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://nauticards.onrender.com/sitemap.xml
