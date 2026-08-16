@@ -690,5 +690,11 @@ async def yandex_verification():
     отдаваться из корня, а не из /static/, иначе Яндекс не найдёт его."""
     return FileResponse("yandex_4d7c72dee74ff60e.html")
 
+@app.get("/google15668f866ce8b430.html")
+async def google_verification():
+    """Файл подтверждения владения сайтом для Google Search Console."""
+    return FileResponse("google15668f866ce8b430.html")
+
+
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
