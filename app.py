@@ -684,4 +684,11 @@ async def root():
     return FileResponse(os.path.join("static", "index.html"))
 
 
+@app.get("/yandex_4d7c72dee74ff60e.html")
+async def yandex_verification():
+    """Файл подтверждения владения сайтом для Яндекс.Вебмастера — должен
+    отдаваться из корня, а не из /static/, иначе Яндекс не найдёт его."""
+    return FileResponse("yandex_4d7c72dee74ff60e.html")
+
+
 app.mount("/static", StaticFiles(directory="static"), name="static")
