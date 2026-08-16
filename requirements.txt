@@ -6,3 +6,4 @@ python-docx
 python-pptx
 requests
 python-dotenv
+fpdf2

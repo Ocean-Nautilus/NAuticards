@@ -39,6 +39,149 @@ fetch("/api/limits")
   .catch(() => { /* останется запасное значение */ });
 
 // ============================================================
+// ДНЕВНОЙ ЛИМИТ (5 бесплатных генераций в день на IP)
+// ============================================================
+const quotaHint = document.getElementById("quotaHint");
+
+function updateQuotaDisplay(remaining, limit){
+  quotaHint.textContent = remaining > 0
+    ? `Осталось ${remaining} из ${limit} бесплатных генераций сегодня`
+    : `Бесплатный лимит на сегодня исчерпан — вернётся завтра`;
+  quotaHint.classList.toggle("low", remaining <= 1);
+}
+
+// ============================================================
+// ПРОМОКОД (даёт безлимит + доступ к платным фичам)
+// ============================================================
+const PROMO_KEY = "nauticards_promo_code";
+
+function getPremiumHeaders(){
+  const code = localStorage.getItem(PROMO_KEY);
+  return code ? { "X-Premium-Code": code } : {};
+}
+
+let isPremiumUser = false;
+
+function applyPremiumUI(premium){
+  isPremiumUser = premium;
+  document.getElementById("themeOpenBtn").style.display = premium ? "inline-block" : "none";
+  document.getElementById("downloadDocxBtn").style.display = premium ? "inline-block" : "none";
+  document.getElementById("downloadPdfBtn").style.display = premium ? "inline-block" : "none";
+}
+
+async function refreshPremiumStatus(){
+  try {
+    const res = await fetch("/api/quota", { headers: getPremiumHeaders() });
+    const data = await res.json();
+    applyPremiumUI(!!data.is_premium);
+    if (data.is_premium) {
+      updateQuotaDisplay(999, 999);
+      quotaHint.textContent = "✨ Безлимит активен";
+    } else {
+      updateQuotaDisplay(data.remaining, data.limit);
+    }
+  } catch { /* останется как есть */ }
+}
+
+const promoInput = document.getElementById("promoInput");
+const promoSaveBtn = document.getElementById("promoSaveBtn");
+const promoStatus = document.getElementById("promoStatus");
+
+// Если код уже сохранён с прошлого раза — покажем его в поле
+if (localStorage.getItem(PROMO_KEY)) {
+  promoInput.value = localStorage.getItem(PROMO_KEY);
+}
+
+promoSaveBtn.addEventListener("click", async () => {
+  const code = promoInput.value.trim();
+  if (!code) return;
+  localStorage.setItem(PROMO_KEY, code);
+
+  const res = await fetch("/api/quota", { headers: getPremiumHeaders() });
+  const data = await res.json();
+
+  if (data.is_premium) {
+    promoStatus.textContent = "✅ Промокод активирован — безлимит включён";
+    promoStatus.classList.remove("error");
+    applyPremiumUI(true);
+    quotaHint.textContent = "✨ Безлимит активен";
+  } else {
+    promoStatus.textContent = "❌ Код не найден, проверь правильность";
+    promoStatus.classList.add("error");
+  }
+});
+
+refreshPremiumStatus();
+
+// ============================================================
+// КАСТОМИЗАЦИЯ ЦВЕТА (только для премиум)
+// ============================================================
+const THEME_KEY = "nauticards_theme";
+const themeOpenBtn = document.getElementById("themeOpenBtn");
+const themeModal = document.getElementById("themeModal");
+const themeModalClose = document.getElementById("themeModalClose");
+const swatches = document.querySelectorAll(".swatch");
+
+function applyTheme(coral, mint){
+  document.documentElement.style.setProperty("--coral", coral);
+  document.documentElement.style.setProperty("--mint", mint);
+  swatches.forEach(s => {
+    s.classList.toggle("active", s.dataset.coral === coral && s.dataset.mint === mint);
+  });
+}
+
+// Восстанавливаем сохранённую тему при загрузке
+const savedTheme = JSON.parse(localStorage.getItem(THEME_KEY) || "null");
+if (savedTheme) applyTheme(savedTheme.coral, savedTheme.mint);
+
+themeOpenBtn.addEventListener("click", () => { themeModal.style.display = "flex"; });
+themeModalClose.addEventListener("click", () => { themeModal.style.display = "none"; });
+themeModal.addEventListener("click", (e) => {
+  if (e.target === themeModal) themeModal.style.display = "none";
+});
+
+swatches.forEach(swatch => {
+  swatch.addEventListener("click", () => {
+    const coral = swatch.dataset.coral;
+    const mint = swatch.dataset.mint;
+    applyTheme(coral, mint);
+    localStorage.setItem(THEME_KEY, JSON.stringify({ coral, mint }));
+  });
+});
+
+// ============================================================
+// ЭКСПОРТ В DOCX / PDF (только для премиум)
+// ============================================================
+async function exportAs(fmt){
+  if (!lastGeneratedCards) return;
+  try {
+    const res = await fetch(`/api/export/${fmt}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getPremiumHeaders() },
+      body: JSON.stringify({ cards: lastGeneratedCards }),
+    });
+    if (!res.ok) {
+      const data = await res.json();
+      throw new Error(data.detail || "Ошибка экспорта");
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `карточки.${fmt}`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    setStatus("Ошибка экспорта: " + err.message, true);
+  }
+}
+
+document.getElementById("downloadDocxBtn").addEventListener("click", () => exportAs("docx"));
+document.getElementById("downloadPdfBtn").addEventListener("click", () => exportAs("pdf"));
+
+// ============================================================
 // ВКЛАДКИ Файл / Текст
 // ============================================================
 const tabButtons = document.querySelectorAll(".tab-btn");
@@ -246,52 +389,86 @@ function renderCards(cards){
 }
 
 // ============================================================
-// КАРТА ЛЕКЦИИ (майндмэп через markmap)
+// ИСТОРИЯ ГЕНЕРАЦИЙ (хранится в localStorage браузера)
 // ============================================================
-let currentMapSessionId = null;
+const HISTORY_KEY = "nauticards_history";
+const HISTORY_LIMIT = 30;
 
-const mapBtn = document.getElementById("mapBtn");
-const mapModal = document.getElementById("mapModal");
-const mapModalClose = document.getElementById("mapModalClose");
-const mapLoading = document.getElementById("mapLoading");
-const mapSvg = document.getElementById("mapSvg");
-
-function closeMapModal(){
-  mapModal.style.display = "none";
+function loadHistory(){
+  try {
+    return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]");
+  } catch {
+    return [];
+  }
 }
 
-mapModalClose.addEventListener("click", closeMapModal);
-mapModal.addEventListener("click", (e) => {
-  if (e.target === mapModal) closeMapModal();
+function addToHistory(entry){
+  const history = loadHistory();
+  history.unshift(entry);
+  localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, HISTORY_LIMIT)));
+  updateHistoryCount();
+}
+
+function clearHistory(){
+  localStorage.removeItem(HISTORY_KEY);
+  updateHistoryCount();
+  renderHistoryList();
+}
+
+const historyBtn = document.getElementById("historyBtn");
+const historyCount = document.getElementById("historyCount");
+const historyModal = document.getElementById("historyModal");
+const historyModalClose = document.getElementById("historyModalClose");
+const historyList = document.getElementById("historyList");
+const clearHistoryBtn = document.getElementById("clearHistoryBtn");
+
+function updateHistoryCount(){
+  historyCount.textContent = loadHistory().length;
+}
+
+function renderHistoryList(){
+  const history = loadHistory();
+  if (history.length === 0){
+    historyList.innerHTML = '<div class="history-empty">Пока пусто — сгенерируй первые карточки</div>';
+    return;
+  }
+  historyList.innerHTML = history.map(item => `
+    <a class="history-item" href="${item.url}" target="_blank" rel="noopener">
+      <span class="hi-title">${item.title}</span>
+      <span class="hi-meta">${item.count} карт. · ${item.date}</span>
+    </a>
+  `).join("");
+}
+
+historyBtn.addEventListener("click", () => {
+  renderHistoryList();
+  historyModal.style.display = "flex";
 });
 
-mapBtn.addEventListener("click", async () => {
-  if (!currentMapSessionId) return;
+historyModalClose.addEventListener("click", () => { historyModal.style.display = "none"; });
+historyModal.addEventListener("click", (e) => {
+  if (e.target === historyModal) historyModal.style.display = "none";
+});
 
-  mapModal.style.display = "flex";
-  mapLoading.style.display = "block";
-  mapSvg.innerHTML = "";
-
-  try {
-    const res = await fetch("/api/generate-map", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ map_session_id: currentMapSessionId }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Не удалось построить карту");
-
-    const { Transformer } = window.markmap;
-    const { Markmap } = window.markmap;
-    const transformer = new Transformer();
-    const { root } = transformer.transform(data.markdown);
-
-    mapLoading.style.display = "none";
-    const mm = Markmap.create(mapSvg, undefined, root);
-    setTimeout(() => mm.fit(), 50);
-  } catch (err) {
-    mapLoading.textContent = "Ошибка: " + err.message;
+clearHistoryBtn.addEventListener("click", () => {
+  if (confirm("Точно очистить историю? Сами карточки по ссылкам останутся доступны, пропадёт только список здесь.")) {
+    clearHistory();
   }
+});
+
+updateHistoryCount();
+
+// ============================================================
+// МОДАЛКА ТАРИФОВ (пока заглушка, без реальной оплаты)
+// ============================================================
+const pricingBtn = document.getElementById("pricingBtn");
+const pricingModal = document.getElementById("pricingModal");
+const pricingModalClose = document.getElementById("pricingModalClose");
+
+pricingBtn.addEventListener("click", () => { pricingModal.style.display = "flex"; });
+pricingModalClose.addEventListener("click", () => { pricingModal.style.display = "none"; });
+pricingModal.addEventListener("click", (e) => {
+  if (e.target === pricingModal) pricingModal.style.display = "none";
 });
 
 // ============================================================
@@ -304,32 +481,12 @@ const shareLinkInput = document.getElementById("shareLinkInput");
 const copyLinkBtn = document.getElementById("copyLinkBtn");
 
 let lastGeneratedCards = null;
+let lastShareUrl = null;
 
-shareBtn.addEventListener("click", async () => {
-  if (!lastGeneratedCards) return;
-
-  shareBtn.disabled = true;
-  shareBtn.textContent = "Сохраняю...";
-
-  try {
-    const res = await fetch("/api/save-set", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ cards: lastGeneratedCards, title: "Набор карточек" }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.detail || "Не удалось сохранить");
-
-    const fullUrl = window.location.origin + data.url;
-    shareLinkInput.value = fullUrl;
-    shareLinkRow.style.display = "flex";
-    shareBtn.textContent = "🔗 Поделиться ссылкой";
-  } catch (err) {
-    setStatus("Не удалось создать ссылку: " + err.message, true);
-    shareBtn.textContent = "🔗 Поделиться ссылкой";
-  } finally {
-    shareBtn.disabled = false;
-  }
+shareBtn.addEventListener("click", () => {
+  if (!lastShareUrl) return;
+  shareLinkInput.value = lastShareUrl;
+  shareLinkRow.style.display = shareLinkRow.style.display === "flex" ? "none" : "flex";
 });
 
 copyLinkBtn.addEventListener("click", () => {
@@ -389,20 +546,40 @@ submitBtn.addEventListener("click", async () => {
   setStatus("");
 
   try {
-    const res = await fetch("/api/generate-cards", { method: "POST", body: formData });
+    const res = await fetch("/api/generate-cards", {
+      method: "POST",
+      body: formData,
+      headers: getPremiumHeaders(),
+    });
     const data = await res.json();
     if (!res.ok){
+      if (res.status === 429) {
+        setStatus(data.detail + " Нажми «💎 Тарифы», чтобы узнать про безлимит.", true);
+        return;
+      }
       throw new Error(data.detail || "Неизвестная ошибка");
     }
     renderCards(data.cards);
     lastGeneratedCards = data.cards;
-    currentMapSessionId = data.map_session_id;
+    lastShareUrl = window.location.origin + data.url;
     shareBox.style.display = "block";
     shareLinkRow.style.display = "none";
+
+    addToHistory({
+      id: data.id,
+      url: data.url,
+      title: data.title || "Карточки",
+      count: data.cards.length,
+      date: new Date().toLocaleDateString("ru-RU"),
+    });
+
     const truncNote = data.was_truncated
       ? ` (лекция длиннее лимита — обработана только первая часть)`
       : "";
     setStatus(`Готово — ${data.cards.length} карточек${truncNote}`);
+    if (!data.is_premium) {
+      updateQuotaDisplay(data.quota_remaining, data.quota_limit);
+    }
   } catch (err){
     setStatus("Ошибка: " + err.message, true);
   } finally {

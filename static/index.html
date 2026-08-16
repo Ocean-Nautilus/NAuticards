@@ -14,10 +14,7 @@
      Яндекс.Вебмастер и Google Search Console после добавления сайта -->
 <meta name="yandex-verification" content="вставь-код-от-яндекса" />
 <meta name="google-site-verification" content="вставь-код-от-google" />
-<link rel="stylesheet" href="/static/style.css?v=7" />
-<script src="https://unpkg.com/d3@7"></script>
-<script src="https://unpkg.com/markmap-lib"></script>
-<script src="https://unpkg.com/markmap-view"></script>
+<link rel="stylesheet" href="/static/style.css?v=10" />
 </head>
 <body>
 
@@ -33,6 +30,7 @@
     <button class="tab-btn" data-tab="text">Текст</button>
   </div>
   <div class="limit-hint" id="limitHint">До 15 000 символов текста или файл до 10 МБ</div>
+  <div class="quota-hint" id="quotaHint"></div>
 
   <div class="tab-content active" id="tab-file">
     <label class="file-drop" id="fileDrop" for="fileInput">
@@ -64,7 +62,8 @@
   <div class="share-actions">
     <button class="share-btn" id="shareBtn">🔗 Поделиться ссылкой</button>
     <button class="download-btn" id="downloadBtn">⬇️ Скачать .txt</button>
-    <button class="map-btn" id="mapBtn">🗺 Карта лекции</button>
+    <button class="download-btn premium-only" id="downloadDocxBtn" style="display:none">📄 .docx</button>
+    <button class="download-btn premium-only" id="downloadPdfBtn" style="display:none">📕 .pdf</button>
   </div>
   <div class="share-link-row" id="shareLinkRow" style="display:none">
     <input type="text" id="shareLinkInput" readonly />
@@ -72,12 +71,77 @@
   </div>
 </div>
 
-<div class="modal-overlay" id="mapModal" style="display:none">
+<div class="history-wrap">
+  <button class="history-btn" id="historyBtn">🕘 История (<span id="historyCount">0</span>)</button>
+  <button class="history-btn pricing-btn" id="pricingBtn">💎 Тарифы</button>
+  <button class="history-btn theme-open-btn" id="themeOpenBtn" style="display:none">🎨 Оформление</button>
+</div>
+
+<div class="modal-overlay" id="pricingModal" style="display:none">
   <div class="modal-box">
-    <button class="modal-close" id="mapModalClose">✕</button>
-    <h3>Карта лекции</h3>
-    <div id="mapLoading" class="map-loading">Строю карту...</div>
-    <svg id="mapSvg" class="map-svg"></svg>
+    <button class="modal-close" id="pricingModalClose">✕</button>
+    <h3>Тарифы</h3>
+    <p class="history-note">Пока в разработке — напиши, если хочешь попасть в число первых с доступом.</p>
+    <div class="pricing-list">
+      <div class="pricing-card">
+        <div class="pricing-name">Бесплатно</div>
+        <div class="pricing-price">0₽</div>
+        <ul>
+          <li>5 генераций в день</li>
+          <li>Квиз-режим, уточнения у ИИ</li>
+          <li>Расшариваемые ссылки</li>
+        </ul>
+      </div>
+      <div class="pricing-card featured">
+        <div class="pricing-name">Безлимит</div>
+        <div class="pricing-price">250–350₽<span>/мес</span></div>
+        <ul>
+          <li>Без дневного лимита</li>
+          <li>Экспорт в Anki / PDF</li>
+          <li>Кастомизация дизайна карточек</li>
+        </ul>
+      </div>
+      <div class="pricing-card">
+        <div class="pricing-name">Для преподавателей</div>
+        <div class="pricing-price">по запросу</div>
+        <ul>
+          <li>Доступ на группу/поток</li>
+          <li>Раздаточный материал с самопроверкой</li>
+        </ul>
+      </div>
+    </div>
+    <a href="https://t.me/@NAuticards" target="_blank" rel="noopener" class="pricing-cta">Написать разработчику</a>
+
+    <div class="promo-row">
+      <input type="text" id="promoInput" placeholder="Есть промокод? Введи сюда" />
+      <button id="promoSaveBtn">Активировать</button>
+    </div>
+    <div class="promo-status" id="promoStatus"></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="themeModal" style="display:none">
+  <div class="modal-box">
+    <button class="modal-close" id="themeModalClose">✕</button>
+    <h3>Оформление карточек</h3>
+    <p class="history-note">Доступно с промокодом безлимита.</p>
+    <div class="theme-swatches" id="themeSwatches">
+      <button class="swatch" data-coral="#FF4D5E" data-mint="#3DDC97" style="background: linear-gradient(135deg,#FF4D5E,#3DDC97)" title="По умолчанию"></button>
+      <button class="swatch" data-coral="#7C86FF" data-mint="#3DDC97" style="background: linear-gradient(135deg,#7C86FF,#3DDC97)" title="Индиго/мята"></button>
+      <button class="swatch" data-coral="#FF9F45" data-mint="#3DDC97" style="background: linear-gradient(135deg,#FF9F45,#3DDC97)" title="Янтарь/мята"></button>
+      <button class="swatch" data-coral="#FF4D5E" data-mint="#C99A3A" style="background: linear-gradient(135deg,#FF4D5E,#C99A3A)" title="Коралл/золото"></button>
+      <button class="swatch" data-coral="#E354D9" data-mint="#3DDC97" style="background: linear-gradient(135deg,#E354D9,#3DDC97)" title="Фуксия/мята"></button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="historyModal" style="display:none">
+  <div class="modal-box">
+    <button class="modal-close" id="historyModalClose">✕</button>
+    <h3>История генераций</h3>
+    <p class="history-note">Хранится в этом браузере. На другом устройстве не видна.</p>
+    <div id="historyList" class="history-list"></div>
+    <button class="clear-history-btn" id="clearHistoryBtn">Очистить историю</button>
   </div>
 </div>
 
@@ -85,17 +149,17 @@
 <p class="empty-hint" id="emptyHint">Здесь появятся карточки после генерации.</p>
 
 <footer class="dev-footer">
-  <a href="https://github.com/твой-username" target="_blank" rel="noopener">
+  <a href="https://github.com/Ocean-Nautilus" target="_blank" rel="noopener">
     <svg class="gh-icon" viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
       <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>
     </svg>
     Разработчик на GitHub
   </a>
-  <a href="https://yoomoney.ru/to/твой-номер-счёта" target="_blank" rel="noopener" class="support-link">
+  <a href="https://yoomoney.ru/to/4100119598322358" target="_blank" rel="noopener" class="support-link">
     ☕ Поддержать автора
   </a>
 </footer>
 
-<script src="/static/script.js?v=5"></script>
+<script src="/static/script.js?v=8"></script>
 </body>
 </html>

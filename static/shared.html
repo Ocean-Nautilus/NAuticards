@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>Набор карточек</title>
-<link rel="stylesheet" href="/static/style.css?v=7" />
+<link rel="stylesheet" href="/static/style.css?v=10" />
 </head>
 <body>
 
@@ -34,6 +34,16 @@
 </footer>
 
 <script>
+  // Применяем сохранённую тему оформления (та же кастомизация, что и
+  // на главной странице) — без этого расшаренная страница всегда
+  // показывала дефолтные цвета, даже если пользователь менял оформление.
+  const THEME_KEY = "nauticards_theme";
+  const savedTheme = JSON.parse(localStorage.getItem(THEME_KEY) || "null");
+  if (savedTheme) {
+    document.documentElement.style.setProperty("--coral", savedTheme.coral);
+    document.documentElement.style.setProperty("--mint", savedTheme.mint);
+  }
+
   const cardsEl = document.getElementById("cards");
   const emptyHint = document.getElementById("emptyHint");
   const statusEl = document.getElementById("status");

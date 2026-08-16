@@ -10,12 +10,14 @@ import asyncio
 from datetime import date
 
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pypdf import PdfReader
 from docx import Document
+from docx.shared import Pt
 from pptx import Presentation
+from fpdf import FPDF
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -53,7 +55,6 @@ class QuotaExceeded(Exception):
 # уточнений и карты лекции первым ставим Pro — там важнее качество ответа.
 MODELS_FOR_CARDS = ["GigaChat", "GigaChat-Pro"]
 MODELS_FOR_CLARIFY = ["GigaChat-Pro", "GigaChat"]
-MODELS_FOR_MAP = ["GigaChat-Pro", "GigaChat"]
 
 # Тариф GigaChat (Freemium) разрешает только 1 одновременный запрос ко
 # всему API-ключу. Если два пользователя нажмут кнопку одновременно —
@@ -91,17 +92,94 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ip_usage (
+            ip TEXT NOT NULL,
+            date TEXT NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (ip, date)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
 
 init_db()
 
-# Временное хранилище текста последних лекций — нужно, чтобы кнопка
-# "Показать карту лекции" могла запросить карту позже, не заставляя
-# пользователя заново загружать файл. Живёт только в памяти процесса
-# (как и счётчик использований) — этого достаточно для тестового этапа.
-_recent_texts: dict[str, str] = {}
+# Бесплатный дневной лимит генераций на один IP-адрес. Пока нет аккаунтов —
+# это самый простой честный способ ограничить бесплатное использование,
+# не заставляя людей регистрироваться.
+# Промокоды для безлимитного доступа (снимают дневной лимит + открывают
+# платные фичи — кастомизацию и доп. форматы экспорта). Пока нет
+# настоящей оплаты — коды выдаёшь вручную (себе и первым клиентам через
+# Telegram). Задаются через .env / Environment Variables на Render,
+# через запятую: PREMIUM_CODES=код1,код2,код3
+PREMIUM_CODES = set(
+    code.strip() for code in os.getenv("PREMIUM_CODES", "").split(",") if code.strip()
+)
+
+
+def is_premium(request: Request) -> bool:
+    code = request.headers.get("x-premium-code", "")
+    return code in PREMIUM_CODES
+
+
+FREE_DAILY_LIMIT = 5
+
+
+def get_client_ip(request: Request) -> str:
+    """Render (и большинство хостингов) работают через прокси — реальный
+    IP пользователя лежит в заголовке X-Forwarded-For, а не в
+    request.client.host (там будет IP самого прокси-сервера)."""
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def check_and_use_quota(ip: str) -> int:
+    """Проверяет дневной лимит для IP, увеличивает счётчик, если лимит не
+    исчерпан. Возвращает, сколько генераций осталось на сегодня после
+    этого запроса. Кидает 429, если лимит уже исчерпан."""
+    today = str(date.today())
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT count FROM ip_usage WHERE ip = ? AND date = ?", (ip, today)
+    ).fetchone()
+    used = row[0] if row else 0
+
+    if used >= FREE_DAILY_LIMIT:
+        conn.close()
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Бесплатный дневной лимит ({FREE_DAILY_LIMIT} генераций) исчерпан. "
+                "Лимит обновится завтра, либо оформи безлимитный доступ."
+            ),
+        )
+
+    conn.execute(
+        "INSERT INTO ip_usage (ip, date, count) VALUES (?, ?, 1) "
+        "ON CONFLICT(ip, date) DO UPDATE SET count = count + 1",
+        (ip, today),
+    )
+    conn.commit()
+    conn.close()
+    return FREE_DAILY_LIMIT - (used + 1)
+
+
+def get_remaining_quota(ip: str) -> int:
+    """Только читает остаток лимита, не тратит его — для отображения в UI."""
+    today = str(date.today())
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute(
+        "SELECT count FROM ip_usage WHERE ip = ? AND date = ?", (ip, today)
+    ).fetchone()
+    conn.close()
+    used = row[0] if row else 0
+    return max(0, FREE_DAILY_LIMIT - used)
 
 
 def get_gigachat_token() -> str:
@@ -248,11 +326,18 @@ def extract_json(raw_text: str, finish_reason: str = "unknown"):
                 reason_hint = "Не хватило max_tokens — ответ обрезан по лимиту длины."
             else:
                 reason_hint = f"Модель завершила ответ некорректно (finish_reason: {finish_reason})."
+            # Показываем именно то место, где сломался парсинг, а не всегда
+            # начало строки — так виднее реальная причина (например,
+            # неэкранированные кавычки внутри значения).
+            pos = e.pos if hasattr(e, "pos") else 0
+            window_start = max(0, pos - 150)
+            window_end = min(len(raw_text), pos + 150)
+            context = raw_text[window_start:window_end]
             raise HTTPException(
                 status_code=502,
                 detail=(
                     f"Ответ от модели повреждён и не удалось восстановить: {e}. {reason_hint} "
-                    f"Сырой ответ: {raw_text[:500]}"
+                    f"Фрагмент рядом с ошибкой: ...{context}..."
                 ),
             )
 
@@ -322,6 +407,10 @@ def build_prompt(source_text: str, level: str = "detailed") -> str:
         "символа [ и заканчивается символом ]), а НЕ объект с ключами-номерами "
         '(НЕ { "0": ..., "1": ... }). Каждый элемент массива — это объект в '
         "фигурных скобках {}, а не строка в кавычках.\n\n"
+        "ВАЖНО ПРО КАВЫЧКИ: если в тексте лекции встречаются названия или "
+        "цитаты в кавычках (например, название проекта \"Pixel Peak\"), "
+        "НЕ используй двойные кавычки внутри значений полей — заменяй их "
+        "на одинарные кавычки ' или просто убирай, иначе сломаешь формат JSON.\n\n"
         "Сделай от 5 до 12 карточек в зависимости от объёма материала. "
         "Не добавляй ничего, кроме самого JSON-массива. Не форматируй JSON "
         "с отступами и переносами строк — верни компактную запись в одну строку, "
@@ -334,32 +423,6 @@ def build_prompt(source_text: str, level: str = "detailed") -> str:
 # FASTAPI ПРИЛОЖЕНИЕ
 # ============================================================
 app = FastAPI(title="Лекция -> Карточки")
-
-
-def build_map_prompt(source_text: str) -> str:
-    """Промпт для карты лекции — просим Markdown с заголовками и списками
-    (не Mermaid!), это надёжно парсится библиотекой markmap на фронтенде
-    и почти невозможно сломать по формату, в отличие от строгого
-    графового синтаксиса."""
-    trimmed = source_text[:MAX_INPUT_CHARS]
-    return (
-        "Построй структурную карту лекции ниже в виде Markdown-документа "
-        "с заголовками и вложенными списками — она станет майндмэпом.\n\n"
-        "СТРОГИЙ ФОРМАТ:\n"
-        "# Название лекции\n"
-        "## Тема 1\n"
-        "- Ключевой факт 1\n"
-        "- Ключевой факт 2\n"
-        "## Тема 2\n"
-        "- Ключевой факт\n"
-        "### Подтема\n"
-        "- Уточняющий факт\n\n"
-        "Правила: 3-7 тем верхнего уровня (##), у каждой 2-5 фактов "
-        "(пункты списка через дефис), при необходимости — подтемы (###). "
-        "Не добавляй ничего, кроме самого Markdown — без пояснений до "
-        "или после, без обёртки в блок кода ```.\n\n"
-        f"Текст лекции:\n{trimmed}"
-    )
 
 
 def build_clarify_prompt(card_question: str, card_answer: str, user_question: str) -> str:
@@ -379,10 +442,15 @@ def build_clarify_prompt(card_question: str, card_answer: str, user_question: st
 
 @app.post("/api/generate-cards")
 async def generate_cards(
+    request: Request,
     file: UploadFile | None = File(default=None),
     text: str | None = Form(default=None),
     level: str = Form(default="detailed"),
 ):
+    client_ip = get_client_ip(request)
+    user_is_premium = is_premium(request)
+    remaining_after = None if user_is_premium else check_and_use_quota(client_ip)
+
     if file is not None:
         content = await file.read()
         if len(content) > MAX_FILE_SIZE_BYTES:
@@ -406,10 +474,18 @@ async def generate_cards(
         raw_response, finish_reason = ask_gigachat_with_fallback(prompt, models=MODELS_FOR_CARDS)
     cards = extract_json(raw_response, finish_reason)
 
-    # Сохраняем текст лекции в памяти — понадобится, если пользователь
-    # позже нажмёт "Показать карту лекции", без повторной загрузки файла.
-    map_session_id = secrets.token_urlsafe(8)
-    _recent_texts[map_session_id] = source_text
+    # Автоматически сохраняем каждую генерацию в БД — это и есть основа
+    # истории: не нужно отдельного действия "сохранить", ссылка и запись
+    # в истории появляются сразу при генерации.
+    set_id = secrets.token_urlsafe(5)
+    title = cards[0].get("title", "Карточки") if cards else "Карточки"
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT INTO card_sets (id, cards_json, title, created_at) VALUES (?, ?, ?, ?)",
+        (set_id, json.dumps(cards, ensure_ascii=False), title, str(date.today())),
+    )
+    conn.commit()
+    conn.close()
 
     today = str(date.today())
     if _usage_stats["date"] != today:
@@ -422,8 +498,23 @@ async def generate_cards(
         "source_length": len(source_text),
         "max_input_chars": MAX_INPUT_CHARS,
         "was_truncated": was_truncated,
-        "map_session_id": map_session_id,
+        "id": set_id,
+        "url": f"/s/{set_id}",
+        "title": title,
+        "quota_remaining": remaining_after,
+        "quota_limit": FREE_DAILY_LIMIT,
+        "is_premium": user_is_premium,
     })
+
+
+@app.get("/api/quota")
+async def get_quota(request: Request):
+    """Позволяет фронтенду показать остаток лимита до генерации, не тратя его."""
+    if is_premium(request):
+        return JSONResponse({"remaining": None, "limit": FREE_DAILY_LIMIT, "is_premium": True})
+    client_ip = get_client_ip(request)
+    remaining = get_remaining_quota(client_ip)
+    return JSONResponse({"remaining": remaining, "limit": FREE_DAILY_LIMIT, "is_premium": False})
 
 
 @app.get("/api/limits")
@@ -432,29 +523,6 @@ async def get_limits():
         "max_input_chars": MAX_INPUT_CHARS,
         "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
     })
-
-
-@app.post("/api/save-set")
-async def save_set(payload: dict = Body(...)):
-    """Сохраняет набор сгенерированных карточек и возвращает короткую
-    ссылку, по которой их можно посмотреть без повторной генерации."""
-    cards = payload.get("cards")
-    title = payload.get("title", "Набор карточек")
-
-    if not cards or not isinstance(cards, list):
-        raise HTTPException(status_code=400, detail="Нет карточек для сохранения")
-
-    set_id = secrets.token_urlsafe(5)  # короткий читаемый ID, например "aB3xQ9"
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO card_sets (id, cards_json, title, created_at) VALUES (?, ?, ?, ?)",
-        (set_id, json.dumps(cards, ensure_ascii=False), title, str(date.today())),
-    )
-    conn.commit()
-    conn.close()
-
-    return JSONResponse({"id": set_id, "url": f"/s/{set_id}"})
 
 
 @app.get("/api/set/{set_id}")
@@ -486,33 +554,6 @@ async def get_stats():
     return JSONResponse(_usage_stats)
 
 
-@app.post("/api/generate-map")
-async def generate_map(payload: dict = Body(...)):
-    """Строит карту лекции (Markdown-outline для рендера через markmap)
-    по тексту, сохранённому при последней генерации карточек."""
-    session_id = payload.get("map_session_id")
-    source_text = _recent_texts.get(session_id)
-
-    if not source_text:
-        raise HTTPException(
-            status_code=404,
-            detail="Текст лекции не найден (сервер мог перезапуститься, или сессия устарела). Сгенерируй карточки заново.",
-        )
-
-    prompt = build_map_prompt(source_text)
-    async with gigachat_semaphore:
-        raw_markdown, finish_reason = ask_gigachat_with_fallback(
-            prompt, models=MODELS_FOR_MAP, max_tokens=2000
-        )
-
-    # На всякий случай чистим обёртку в блок кода, если модель её добавила
-    cleaned = raw_markdown.strip()
-    cleaned = re.sub(r"^```(markdown|md)?", "", cleaned).strip()
-    cleaned = re.sub(r"```$", "", cleaned).strip()
-
-    return JSONResponse({"markdown": cleaned})
-
-
 @app.post("/api/clarify")
 async def clarify_card(payload: dict = Body(...)):
     """Отвечает на уточняющий вопрос студента по конкретной карточке."""
@@ -540,6 +581,102 @@ async def robots_txt():
 @app.get("/sitemap.xml")
 async def sitemap_xml():
     return FileResponse(os.path.join("static", "sitemap.xml"), media_type="application/xml")
+
+
+@app.post("/api/export/{fmt}")
+async def export_cards(fmt: str, request: Request, payload: dict = Body(...)):
+    """Экспорт набора карточек в docx или pdf — платная фича, доступна
+    только с валидным промокодом (см. is_premium)."""
+    if not is_premium(request):
+        raise HTTPException(
+            status_code=403,
+            detail="Экспорт в этот формат доступен только с промокодом безлимита.",
+        )
+
+    cards = payload.get("cards", [])
+    if not cards:
+        raise HTTPException(status_code=400, detail="Нет карточек для экспорта")
+
+    if fmt == "docx":
+        buffer = build_docx(cards)
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        ascii_name, utf8_name = "cards.docx", "карточки.docx"
+    elif fmt == "pdf":
+        buffer = build_pdf(cards)
+        media_type = "application/pdf"
+        ascii_name, utf8_name = "cards.pdf", "карточки.pdf"
+    else:
+        raise HTTPException(status_code=400, detail="Неизвестный формат (доступны: docx, pdf)")
+
+    # HTTP-заголовки должны быть latin-1 — кириллицу напрямую в имя файла
+    # положить нельзя. Даём ASCII-имя как основное (filename=) и правильно
+    # закодированное кириллическое имя (filename*=UTF-8''...) для браузеров,
+    # которые его поддерживают — так скачается "карточки.pdf", а не "cards.pdf".
+    from urllib.parse import quote
+    content_disposition = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(utf8_name)}"
+    )
+
+    return StreamingResponse(
+        buffer,
+        media_type=media_type,
+        headers={"Content-Disposition": content_disposition},
+    )
+
+
+def build_docx(cards: list) -> io.BytesIO:
+    doc = Document()
+    title = doc.add_heading("Карточки для повторения", level=1)
+
+    for card in cards:
+        doc.add_heading(card.get("title", ""), level=2)
+        p_tags = doc.add_paragraph()
+        p_tags.add_run(" · ".join(card.get("tags", []))).italic = True
+
+        p_q = doc.add_paragraph()
+        run_q = p_q.add_run("Вопрос: " + card.get("question", ""))
+        run_q.bold = True
+
+        doc.add_paragraph("Ответ: " + card.get("answer", ""))
+        doc.add_paragraph("")  # пустая строка между карточками
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans.ttf")
+
+
+def build_pdf(cards: list) -> io.BytesIO:
+    pdf = FPDF()
+    pdf.add_page()
+    # Стандартные PDF-шрифты не поддерживают кириллицу — подключаем
+    # DejaVu Sans, у которого есть нужные символы.
+    pdf.add_font("DejaVu", "", FONT_PATH)
+    pdf.set_font("DejaVu", size=16)
+    pdf.cell(0, 12, "Карточки для повторения", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(4)
+
+    for card in cards:
+        pdf.set_font("DejaVu", size=13)
+        pdf.multi_cell(0, 8, card.get("title", ""), new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("DejaVu", size=10)
+        tags = " · ".join(card.get("tags", []))
+        if tags:
+            pdf.multi_cell(0, 6, tags, new_x="LMARGIN", new_y="NEXT")
+
+        pdf.set_font("DejaVu", size=11)
+        pdf.multi_cell(0, 7, "Вопрос: " + card.get("question", ""), new_x="LMARGIN", new_y="NEXT")
+        pdf.multi_cell(0, 7, "Ответ: " + card.get("answer", ""), new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(6)
+
+    buffer = io.BytesIO(pdf.output())
+    buffer.seek(0)
+    return buffer
 
 
 @app.get("/")
