@@ -43,10 +43,11 @@ fetch("/api/limits")
 // ============================================================
 const quotaHint = document.getElementById("quotaHint");
 
-function updateQuotaDisplay(remaining, limit){
+function updateQuotaDisplay(remaining, limit, isPro){
+  const label = isPro ? "PRO" : "бесплатных";
   quotaHint.textContent = remaining > 0
-    ? `Осталось ${remaining} из ${limit} бесплатных генераций сегодня`
-    : `Бесплатный лимит на сегодня исчерпан — вернётся завтра`;
+    ? `Осталось ${remaining} из ${limit} ${label} генераций сегодня`
+    : `Дневной лимит (${limit}) исчерпан — вернётся завтра`;
   quotaHint.classList.toggle("low", remaining <= 1);
 }
 
@@ -74,12 +75,7 @@ async function refreshPremiumStatus(){
     const res = await fetch("/api/quota", { headers: getPremiumHeaders() });
     const data = await res.json();
     applyPremiumUI(!!data.is_premium);
-    if (data.is_premium) {
-      updateQuotaDisplay(999, 999);
-      quotaHint.textContent = "✨ Безлимит активен";
-    } else {
-      updateQuotaDisplay(data.remaining, data.limit);
-    }
+    updateQuotaDisplay(data.remaining, data.limit, data.is_premium);
   } catch { /* останется как есть */ }
 }
 
@@ -101,10 +97,10 @@ promoSaveBtn.addEventListener("click", async () => {
   const data = await res.json();
 
   if (data.is_premium) {
-    promoStatus.textContent = "✅ Промокод активирован — безлимит включён";
+    promoStatus.textContent = "✅ Промокод активирован — тариф PRO включён";
     promoStatus.classList.remove("error");
     applyPremiumUI(true);
-    quotaHint.textContent = "✨ Безлимит активен";
+    updateQuotaDisplay(data.remaining, data.limit, true);
   } else {
     promoStatus.textContent = "❌ Код не найден, проверь правильность";
     promoStatus.classList.add("error");
@@ -577,9 +573,7 @@ submitBtn.addEventListener("click", async () => {
       ? ` (лекция длиннее лимита — обработана только первая часть)`
       : "";
     setStatus(`Готово — ${data.cards.length} карточек${truncNote}`);
-    if (!data.is_premium) {
-      updateQuotaDisplay(data.quota_remaining, data.quota_limit);
-    }
+    updateQuotaDisplay(data.quota_remaining, data.quota_limit, data.is_premium);
   } catch (err){
     setStatus("Ошибка: " + err.message, true);
   } finally {

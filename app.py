@@ -7,6 +7,8 @@ import time
 import sqlite3
 import secrets
 import asyncio
+import itertools
+import hashlib
 from datetime import date
 
 import requests
@@ -61,7 +63,44 @@ MODELS_FOR_CLARIFY = ["GigaChat-Pro", "GigaChat"]
 # второй запрос без этой защиты просто получит ошибку от GigaChat.
 # Семафор ставит все запросы в очередь: они выполняются по одному,
 # автоматически дожидаясь освобождения "потока", вместо падения с ошибкой.
-gigachat_semaphore = asyncio.Semaphore(1)
+# ============================================================
+# ПРИОРИТЕТНАЯ ОЧЕРЕДЬ К GIGACHAT
+# ============================================================
+# У аккаунта GigaChat всего 1 одновременный поток запросов (см. тариф) —
+# запросы и так идут строго по очереди. Чтобы PRO/Учительский тариф
+# ощутимо обрабатывались быстрее при нагрузке — премиум-запросы получают
+# приоритет 0, бесплатные — приоритет 1: если оба ждут одновременно,
+# первым обслужат премиум-запрос, даже если он пришёл позже.
+_gigachat_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
+_queue_counter = itertools.count()
+
+
+async def _gigachat_dispatcher():
+    """Фоновая задача: разбирает очередь по приоритету и пропускает
+    запросы к GigaChat строго по одному (реальный лимит тарифа)."""
+    while True:
+        _priority, _count, ready_event, done_event = await _gigachat_queue.get()
+        ready_event.set()
+        await done_event.wait()
+
+
+class gigachat_slot:
+    """Контекстный менеджер: 'занимает очередь' на обращение к GigaChat.
+    Использование: async with gigachat_slot(is_premium_user): ..."""
+
+    def __init__(self, is_premium_user: bool):
+        self.priority = 0 if is_premium_user else 1
+
+    async def __aenter__(self):
+        self.ready = asyncio.Event()
+        self.done = asyncio.Event()
+        await _gigachat_queue.put((self.priority, next(_queue_counter), self.ready, self.done))
+        await self.ready.wait()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.done.set()
+        return False
 
 # Простой счётчик использований в памяти (сбрасывается при перезапуске
 # сервера). Для реальной статистики между перезапусками потребуется база
@@ -102,6 +141,14 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS clarify_usage (
+            key TEXT PRIMARY KEY,
+            count INTEGER NOT NULL DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -127,6 +174,7 @@ def is_premium(request: Request) -> bool:
 
 
 FREE_DAILY_LIMIT = 5
+PRO_DAILY_LIMIT = 30
 
 
 def get_client_ip(request: Request) -> str:
@@ -139,7 +187,7 @@ def get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def check_and_use_quota(ip: str) -> int:
+def check_and_use_quota(ip: str, limit: int) -> int:
     """Проверяет дневной лимит для IP, увеличивает счётчик, если лимит не
     исчерпан. Возвращает, сколько генераций осталось на сегодня после
     этого запроса. Кидает 429, если лимит уже исчерпан."""
@@ -150,13 +198,13 @@ def check_and_use_quota(ip: str) -> int:
     ).fetchone()
     used = row[0] if row else 0
 
-    if used >= FREE_DAILY_LIMIT:
+    if used >= limit:
         conn.close()
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Бесплатный дневной лимит ({FREE_DAILY_LIMIT} генераций) исчерпан. "
-                "Лимит обновится завтра, либо оформи безлимитный доступ."
+                f"Дневной лимит ({limit} генераций) исчерпан. "
+                "Лимит обновится завтра, либо оформи/улучши тариф."
             ),
         )
 
@@ -167,10 +215,10 @@ def check_and_use_quota(ip: str) -> int:
     )
     conn.commit()
     conn.close()
-    return FREE_DAILY_LIMIT - (used + 1)
+    return limit - (used + 1)
 
 
-def get_remaining_quota(ip: str) -> int:
+def get_remaining_quota(ip: str, limit: int) -> int:
     """Только читает остаток лимита, не тратит его — для отображения в UI."""
     today = str(date.today())
     conn = sqlite3.connect(DB_PATH)
@@ -179,7 +227,36 @@ def get_remaining_quota(ip: str) -> int:
     ).fetchone()
     conn.close()
     used = row[0] if row else 0
-    return max(0, FREE_DAILY_LIMIT - used)
+    return max(0, limit - used)
+
+
+# Бесплатным доступно 1 уточнение у ИИ на карточку — привязываем лимит
+# к паре (IP, конкретный вопрос карточки), а не к аккаунту (аккаунтов
+# пока нет). Хэш вопроса используется как стабильный "ID карточки" без
+# необходимости менять структуру данных карточек.
+CLARIFY_FREE_LIMIT = 1
+
+
+def check_and_use_clarify(ip: str, card_question: str):
+    key = ip + "|" + hashlib.sha256(card_question.encode("utf-8")).hexdigest()[:16]
+    conn = sqlite3.connect(DB_PATH)
+    row = conn.execute("SELECT count FROM clarify_usage WHERE key = ?", (key,)).fetchone()
+    used = row[0] if row else 0
+
+    if used >= CLARIFY_FREE_LIMIT:
+        conn.close()
+        raise HTTPException(
+            status_code=429,
+            detail="В бесплатной версии доступно 1 уточнение на карточку. В PRO — без ограничений.",
+        )
+
+    conn.execute(
+        "INSERT INTO clarify_usage (key, count) VALUES (?, 1) "
+        "ON CONFLICT(key) DO UPDATE SET count = count + 1",
+        (key,),
+    )
+    conn.commit()
+    conn.close()
 
 
 def get_gigachat_token() -> str:
@@ -425,6 +502,11 @@ def build_prompt(source_text: str, level: str = "detailed") -> str:
 app = FastAPI(title="Лекция -> Карточки")
 
 
+@app.on_event("startup")
+async def start_gigachat_dispatcher():
+    asyncio.create_task(_gigachat_dispatcher())
+
+
 def build_clarify_prompt(card_question: str, card_answer: str, user_question: str) -> str:
     """Промпт для уточняющего вопроса по конкретной карточке. Даём модели
     только контекст этой карточки (не всю лекцию) — так дешевле и быстрее,
@@ -449,7 +531,8 @@ async def generate_cards(
 ):
     client_ip = get_client_ip(request)
     user_is_premium = is_premium(request)
-    remaining_after = None if user_is_premium else check_and_use_quota(client_ip)
+    daily_limit = PRO_DAILY_LIMIT if user_is_premium else FREE_DAILY_LIMIT
+    remaining_after = check_and_use_quota(client_ip, daily_limit)
 
     if file is not None:
         content = await file.read()
@@ -470,7 +553,7 @@ async def generate_cards(
     was_truncated = len(source_text) > MAX_INPUT_CHARS
 
     prompt = build_prompt(source_text, level=level)
-    async with gigachat_semaphore:
+    async with gigachat_slot(user_is_premium):
         raw_response, finish_reason = ask_gigachat_with_fallback(prompt, models=MODELS_FOR_CARDS)
     cards = extract_json(raw_response, finish_reason)
 
@@ -502,7 +585,7 @@ async def generate_cards(
         "url": f"/s/{set_id}",
         "title": title,
         "quota_remaining": remaining_after,
-        "quota_limit": FREE_DAILY_LIMIT,
+        "quota_limit": daily_limit,
         "is_premium": user_is_premium,
     })
 
@@ -510,11 +593,11 @@ async def generate_cards(
 @app.get("/api/quota")
 async def get_quota(request: Request):
     """Позволяет фронтенду показать остаток лимита до генерации, не тратя его."""
-    if is_premium(request):
-        return JSONResponse({"remaining": None, "limit": FREE_DAILY_LIMIT, "is_premium": True})
+    user_is_premium = is_premium(request)
+    daily_limit = PRO_DAILY_LIMIT if user_is_premium else FREE_DAILY_LIMIT
     client_ip = get_client_ip(request)
-    remaining = get_remaining_quota(client_ip)
-    return JSONResponse({"remaining": remaining, "limit": FREE_DAILY_LIMIT, "is_premium": False})
+    remaining = get_remaining_quota(client_ip, daily_limit)
+    return JSONResponse({"remaining": remaining, "limit": daily_limit, "is_premium": user_is_premium})
 
 
 @app.get("/api/limits")
@@ -555,7 +638,7 @@ async def get_stats():
 
 
 @app.post("/api/clarify")
-async def clarify_card(payload: dict = Body(...)):
+async def clarify_card(request: Request, payload: dict = Body(...)):
     """Отвечает на уточняющий вопрос студента по конкретной карточке."""
     card_question = payload.get("card_question", "")
     card_answer = payload.get("card_answer", "")
@@ -564,8 +647,13 @@ async def clarify_card(payload: dict = Body(...)):
     if not user_question.strip():
         raise HTTPException(status_code=400, detail="Вопрос пустой")
 
+    user_is_premium = is_premium(request)
+    if not user_is_premium:
+        client_ip = get_client_ip(request)
+        check_and_use_clarify(client_ip, card_question)  # кидает 429, если лимит исчерпан
+
     prompt = build_clarify_prompt(card_question, card_answer, user_question)
-    async with gigachat_semaphore:
+    async with gigachat_slot(user_is_premium):
         answer_text, _ = ask_gigachat_with_fallback(
             prompt, models=MODELS_FOR_CLARIFY, max_tokens=500
         )
@@ -684,17 +772,13 @@ async def root():
     return FileResponse(os.path.join("static", "index.html"))
 
 
-@app.get("/yandex_4d7c72dee74ff60e.html")
-async def yandex_verification():
-    """Файл подтверждения владения сайтом для Яндекс.Вебмастера — должен
-    отдаваться из корня, а не из /static/, иначе Яндекс не найдёт его."""
-    return FileResponse("yandex_4d7c72dee74ff60e.html")
-
-@app.get("/google15668f866ce8b430.html")
-async def google_verification():
-    """Файл подтверждения владения сайтом для Google Search Console."""
-    return FileResponse("google15668f866ce8b430.html")
-
-
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Общий механизм для файлов подтверждения владения сайтом (Яндекс.Вебмастер,
+# Google Search Console и т.п.) — все они требуют файл именно в корне сайта
+# (https://сайт/имя_файла.html), а не в /static/. Вместо того чтобы каждый
+# раз добавлять новый @app.get(...) под конкретное имя файла — просто
+# кладёшь файл в папку verify/ рядом с app.py, и он автоматически станет
+# доступен в корне сайта под тем же именем.
+app.mount("/", StaticFiles(directory="verify"), name="verify")
