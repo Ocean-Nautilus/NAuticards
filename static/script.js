@@ -461,11 +461,16 @@ const pricingBtn = document.getElementById("pricingBtn");
 const pricingModal = document.getElementById("pricingModal");
 const pricingModalClose = document.getElementById("pricingModalClose");
 
-pricingBtn.addEventListener("click", () => { pricingModal.style.display = "flex"; });
-pricingModalClose.addEventListener("click", () => { pricingModal.style.display = "none"; });
-pricingModal.addEventListener("click", (e) => {
-  if (e.target === pricingModal) pricingModal.style.display = "none";
-});
+// Кнопка «Тарифы» скрыта из интерфейса. Окно (там же ввод промокода)
+// открывается секретной ссылкой: https://nauticards.onrender.com/#pro
+if (pricingBtn) pricingBtn.addEventListener("click", () => { pricingModal.style.display = "flex"; });
+if (pricingModalClose) pricingModalClose.addEventListener("click", () => { pricingModal.style.display = "none"; });
+if (pricingModal) {
+  pricingModal.addEventListener("click", (e) => {
+    if (e.target === pricingModal) pricingModal.style.display = "none";
+  });
+  if (location.hash === "#pro") pricingModal.style.display = "flex";
+}
 
 // ============================================================
 // КНОПКА "ПОДЕЛИТЬСЯ ССЫЛКОЙ"
@@ -550,7 +555,7 @@ submitBtn.addEventListener("click", async () => {
     const data = await res.json();
     if (!res.ok){
       if (res.status === 429) {
-        setStatus(data.detail + " Нажми «💎 Тарифы», чтобы узнать про безлимит.", true);
+        setStatus(data.detail + " Приходи завтра!", true);
         return;
       }
       throw new Error(data.detail || "Неизвестная ошибка");
