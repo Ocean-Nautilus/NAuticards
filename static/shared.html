@@ -3,131 +3,59 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Набор карточек</title>
-<link rel="stylesheet" href="/static/style.css?v=10" />
+<title>Набор карточек — Conspector</title>
+<meta name="robots" content="noindex" />
+<meta name="color-scheme" content="light dark" />
+<link rel="stylesheet" href="/static/style.css?v=11" />
 </head>
 <body>
+<div class="wrap">
 
-<header>
-  <div class="eyebrow">Конспект → Карточка</div>
-  <h1 id="setTitle">Загружаю набор...</h1>
-  <p>Кто-то поделился с тобой набором карточек для повторения. Нажми на карточку, чтобы увидеть ответ.</p>
-</header>
+  <header class="site-head">
+    <a class="brand" href="/">Conspector</a>
+    <h1 id="setTitle">Загружаю набор…</h1>
+    <p class="lead">Кто-то поделился с тобой набором карточек. Нажми на карточку, чтобы увидеть ответ.</p>
+  </header>
 
-<div class="back-home-wrap">
-  <a href="/" class="back-home-btn">📎 Загрузить свою лекцию</a>
+  <main>
+    <p class="status" id="status" role="status"></p>
+
+    <div class="actions" id="downloadBox" hidden>
+      <button type="button" class="btn" id="downloadBtn">Скачать .txt</button>
+      <a class="btn" href="/">Загрузить свою лекцию</a>
+    </div>
+
+    <div id="cards"></div>
+    <p class="empty" id="emptyHint" hidden>Набор не найден — возможно, ссылка устарела.</p>
+  </main>
+
+  <footer class="foot">
+    <a href="/">Создать свой набор карточек →</a>
+  </footer>
+
 </div>
-
-<div class="status" id="status"></div>
-<div class="share-box" id="downloadBox" style="display:none">
-  <div class="share-actions">
-    <button class="download-btn" id="downloadBtn">⬇️ Скачать .txt</button>
-  </div>
-</div>
-
-<div id="cards"></div>
-<p class="empty-hint" id="emptyHint" style="display:none">Набор не найден — возможно, ссылка устарела.</p>
-
-<footer class="dev-footer">
-  <a href="/">Создать свой набор карточек →</a>
-</footer>
-
+<script src="/static/common.js?v=11"></script>
 <script>
-  // Применяем сохранённую тему оформления (та же кастомизация, что и
-  // на главной странице) — без этого расшаренная страница всегда
-  // показывала дефолтные цвета, даже если пользователь менял оформление.
-  const THEME_KEY = "nauticards_theme";
-  const savedTheme = JSON.parse(localStorage.getItem(THEME_KEY) || "null");
-  if (savedTheme) {
-    document.documentElement.style.setProperty("--coral", savedTheme.coral);
-    document.documentElement.style.setProperty("--mint", savedTheme.mint);
-  }
+  let cards = [];
 
-  const cardsEl = document.getElementById("cards");
-  const emptyHint = document.getElementById("emptyHint");
-  const statusEl = document.getElementById("status");
-  const setTitleEl = document.getElementById("setTitle");
-  const downloadBox = document.getElementById("downloadBox");
-  const downloadBtn = document.getElementById("downloadBtn");
-
-  let loadedCards = null;
-
-  function cardToText(card){
-    return `${card.title || ""}\n\nВопрос: ${card.question || ""}\nОтвет: ${card.answer || ""}\n`;
-  }
-
-  function downloadCardsAsText(cards, filename = "карточки.txt"){
-    const content = cards.map(cardToText).join("\n---\n\n");
-    const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
-  downloadBtn.addEventListener("click", () => {
-    if (loadedCards) downloadCardsAsText(loadedCards);
-  });
-
-  function renderCards(cards){
-    cardsEl.innerHTML = "";
-    if (!cards || cards.length === 0){
-      emptyHint.style.display = "block";
-      return;
-    }
-    cards.forEach((card) => {
-      const el = document.createElement("div");
-      el.className = "card";
-      const tags = (card.tags || []).map(t => `<span class="tag">${t}</span>`).join("");
-
-      el.innerHTML = `
-        <button class="copy-btn" title="Скопировать карточку">📋</button>
-        <div class="tag-row">${tags}</div>
-        <h3>${card.title || ""}</h3>
-        <div class="q">${card.question || ""}</div>
-        <div class="a">${card.answer || ""}</div>
-      `;
-
-      const answerEl = el.querySelector(".a");
-      el.addEventListener("click", () => {
-        answerEl.classList.toggle("revealed");
-      });
-
-      const copyBtn = el.querySelector(".copy-btn");
-      copyBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        navigator.clipboard.writeText(cardToText(card));
-        copyBtn.textContent = "✅";
-        setTimeout(() => { copyBtn.textContent = "📋"; }, 1200);
-      });
-
-      cardsEl.appendChild(el);
-    });
-  }
-
-  // Достаём ID набора из URL вида /s/aB3xQ9
-  const setId = window.location.pathname.split("/").pop();
-
-  fetch(`/api/set/${setId}`)
-    .then(res => {
-      if (!res.ok) throw new Error("Набор не найден");
+  fetch(`/api/set/${encodeURIComponent(location.pathname.split("/").pop())}`)
+    .then((res) => {
+      if (!res.ok) throw new Error();
       return res.json();
     })
-    .then(data => {
-      setTitleEl.textContent = data.title || "Набор карточек";
-      loadedCards = data.cards;
-      renderCards(data.cards);
-      downloadBox.style.display = "block";
+    .then((data) => {
+      cards = data.cards;
+      $("setTitle").textContent = data.title || "Набор карточек";
+      document.title = `${data.title || "Набор карточек"} — Conspector`;
+      renderCards(cards);
+      $("downloadBox").hidden = false;
     })
     .catch(() => {
-      setTitleEl.textContent = "Набор не найден";
-      emptyHint.style.display = "block";
+      $("setTitle").textContent = "Набор не найден";
+      $("emptyHint").hidden = false;
     });
-</script>
 
+  $("downloadBtn").addEventListener("click", () => downloadCardsAsText(cards));
+</script>
 </body>
 </html>

@@ -1,310 +1,214 @@
-import os
+import asyncio
 import io
 import json
-import re
-import uuid
-import time
-import sqlite3
-import secrets
-import asyncio
-import itertools
 import hashlib
+import os
+import re
+import secrets
+import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
 from datetime import date
+from urllib.parse import quote
 
 import requests
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Request
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
-from pypdf import PdfReader
-from docx import Document
-from docx.shared import Pt
-from pptx import Presentation
-from fpdf import FPDF
+import urllib3
 from dotenv import load_dotenv
+from fastapi import Body, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATIC_DIR = os.path.join(BASE_DIR, "static")
+VERIFY_DIR = os.path.join(BASE_DIR, "verify")
+DB_PATH = os.path.join(BASE_DIR, "cards.db")
+FONT_PATH = os.path.join(BASE_DIR, "fonts", "DejaVuSans.ttf")
+
 # ============================================================
-# КОНФИГ GIGACHAT
+# КОНФИГ
 # ============================================================
 GIGACHAT_AUTH_KEY = os.getenv("GIGACHAT_AUTH_KEY", "")
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
-
 OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 CHAT_URL = "https://gigachat.devices.sberbank.ru/api/v1/chat/completions"
 
-# GigaChat использует сертификаты российского удостоверяющего центра.
-# Для быстрого старта проверку SSL отключаем — см. README про продакшен-вариант.
-VERIFY_SSL = False
+# GigaChat использует сертификаты российского УЦ. По умолчанию проверка
+# отключена (как и раньше); для продакшена: GIGACHAT_VERIFY_SSL=1 и
+# установленный корневой сертификат Минцифры.
+VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "0") == "1"
+if not VERIFY_SSL:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Максимальная длина текста лекции, которую отправляем в GigaChat за раз.
 MAX_INPUT_CHARS = 15000
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+MAX_EXPORT_CARDS = 100
 
-# Максимальный размер загружаемого файла (в байтах). 10 МБ с запасом
-# хватает на любую текстовую лекцию — так пользователь не положит сервер,
-# закинув видео или огромный архив по ошибке.
-MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 МБ
+DAILY_LIMIT = 5          # генераций в сутки на один IP
+CLARIFY_LIMIT = 1        # уточнений к одной карточке на один IP
 
-
-class QuotaExceeded(Exception):
-    """Внутреннее исключение: у модели закончился бесплатный баланс токенов."""
-    pass
-
-
-# Порядок моделей для разных задач — если на первой в списке кончился
-# баланс, автоматически пробуем следующую. Карточки — самая частая
-# операция, поэтому впереди Lite (у него больше всего токенов). Для
-# уточнений и карты лекции первым ставим Pro — там важнее качество ответа.
+# Если на первой модели кончился баланс токенов — пробуем следующую.
 MODELS_FOR_CARDS = ["GigaChat", "GigaChat-Pro"]
 MODELS_FOR_CLARIFY = ["GigaChat-Pro", "GigaChat"]
 
-# Тариф GigaChat (Freemium) разрешает только 1 одновременный запрос ко
-# всему API-ключу. Если два пользователя нажмут кнопку одновременно —
-# второй запрос без этой защиты просто получит ошибку от GigaChat.
-# Семафор ставит все запросы в очередь: они выполняются по одному,
-# автоматически дожидаясь освобождения "потока", вместо падения с ошибкой.
-# ============================================================
-# ПРИОРИТЕТНАЯ ОЧЕРЕДЬ К GIGACHAT
-# ============================================================
-# У аккаунта GigaChat всего 1 одновременный поток запросов (см. тариф) —
-# запросы и так идут строго по очереди. Чтобы PRO/Учительский тариф
-# ощутимо обрабатывались быстрее при нагрузке — премиум-запросы получают
-# приоритет 0, бесплатные — приоритет 1: если оба ждут одновременно,
-# первым обслужат премиум-запрос, даже если он пришёл позже.
-_gigachat_queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
-_queue_counter = itertools.count()
 
+class QuotaExceeded(Exception):
+    """У модели закончился бесплатный баланс токенов."""
 
-async def _gigachat_dispatcher():
-    """Фоновая задача: разбирает очередь по приоритету и пропускает
-    запросы к GigaChat строго по одному (реальный лимит тарифа)."""
-    while True:
-        _priority, _count, ready_event, done_event = await _gigachat_queue.get()
-        ready_event.set()
-        await done_event.wait()
-
-
-class gigachat_slot:
-    """Контекстный менеджер: 'занимает очередь' на обращение к GigaChat.
-    Использование: async with gigachat_slot(is_premium_user): ..."""
-
-    def __init__(self, is_premium_user: bool):
-        self.priority = 0 if is_premium_user else 1
-
-    async def __aenter__(self):
-        self.ready = asyncio.Event()
-        self.done = asyncio.Event()
-        await _gigachat_queue.put((self.priority, next(_queue_counter), self.ready, self.done))
-        await self.ready.wait()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        self.done.set()
-        return False
-
-# Простой счётчик использований в памяти (сбрасывается при перезапуске
-# сервера). Для реальной статистики между перезапусками потребуется база
-# данных, но для теста на группе этого достаточно.
-_usage_stats = {"date": str(date.today()), "count": 0}
-
-_token_cache = {"access_token": None, "expires_at": 0}
 
 # ============================================================
-# ХРАНИЛИЩЕ ДЛЯ РАСШАРИВАЕМЫХ НАБОРОВ КАРТОЧЕК (SQLite)
+# БАЗА ДАННЫХ (SQLite)
+# На бесплатном Render диск не постоянный: файл может обнулиться
+# при передеплое.
 # ============================================================
-# ВАЖНО: на бесплатном тарифе Render диск не постоянный — файл базы
-# может обнулиться при перезапуске/передеплое сервиса. Для теста на
-# группе этого достаточно; для долгосрочного хранения ссылок в будущем
-# потребуется подключить постоянную БД (например, Render Postgres).
-DB_PATH = os.path.join(os.path.dirname(__file__), "cards.db")
+@contextmanager
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        with conn:  # commit / rollback
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS card_sets (
-            id TEXT PRIMARY KEY,
-            cards_json TEXT NOT NULL,
-            title TEXT,
-            created_at TEXT NOT NULL
+    with db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS card_sets (
+                id TEXT PRIMARY KEY,
+                cards_json TEXT NOT NULL,
+                title TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ip_usage (
+                ip TEXT NOT NULL,
+                date TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (ip, date)
+            );
+            CREATE TABLE IF NOT EXISTS clarify_usage (
+                key TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0
+            );
+            """
         )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS ip_usage (
-            ip TEXT NOT NULL,
-            date TEXT NOT NULL,
-            count INTEGER NOT NULL DEFAULT 0,
-            PRIMARY KEY (ip, date)
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS clarify_usage (
-            key TEXT PRIMARY KEY,
-            count INTEGER NOT NULL DEFAULT 0
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
 
 
 init_db()
 
-# Бесплатный дневной лимит генераций на один IP-адрес. Пока нет аккаунтов —
-# это самый простой честный способ ограничить бесплатное использование,
-# не заставляя людей регистрироваться.
-# Промокоды для безлимитного доступа (снимают дневной лимит + открывают
-# платные фичи — кастомизацию и доп. форматы экспорта). Пока нет
-# настоящей оплаты — коды выдаёшь вручную (себе и первым клиентам через
-# Telegram). Задаются через .env / Environment Variables на Render,
-# через запятую: PREMIUM_CODES=код1,код2,код3
-PREMIUM_CODES = set(
-    code.strip() for code in os.getenv("PREMIUM_CODES", "").split(",") if code.strip()
-)
 
-
-def is_premium(request: Request) -> bool:
-    code = request.headers.get("x-premium-code", "")
-    return code in PREMIUM_CODES
-
-
-FREE_DAILY_LIMIT = 5
-PRO_DAILY_LIMIT = 30
-
-
-def get_client_ip(request: Request) -> str:
-    """Render (и большинство хостингов) работают через прокси — реальный
-    IP пользователя лежит в заголовке X-Forwarded-For, а не в
-    request.client.host (там будет IP самого прокси-сервера)."""
+def client_ip(request: Request) -> str:
+    """За прокси (Render) реальный IP лежит в X-Forwarded-For."""
     forwarded = request.headers.get("x-forwarded-for")
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
-def check_and_use_quota(ip: str, limit: int) -> int:
-    """Проверяет дневной лимит для IP, увеличивает счётчик, если лимит не
-    исчерпан. Возвращает, сколько генераций осталось на сегодня после
-    этого запроса. Кидает 429, если лимит уже исчерпан."""
-    today = str(date.today())
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT count FROM ip_usage WHERE ip = ? AND date = ?", (ip, today)
-    ).fetchone()
-    used = row[0] if row else 0
+def remaining_quota(ip: str) -> int:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT count FROM ip_usage WHERE ip = ? AND date = ?",
+            (ip, date.today().isoformat()),
+        ).fetchone()
+    return max(0, DAILY_LIMIT - (row[0] if row else 0))
 
-    if used >= limit:
-        conn.close()
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                f"Дневной лимит ({limit} генераций) исчерпан. "
-                "Лимит обновится завтра, либо оформи/улучши тариф."
-            ),
+
+def use_quota(ip: str) -> int:
+    """Атомарно списывает одну генерацию. Возвращает остаток или кидает 429."""
+    today = date.today().isoformat()
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO ip_usage (ip, date, count) VALUES (?, ?, 1) "
+            "ON CONFLICT(ip, date) DO UPDATE SET count = count + 1 WHERE count < ?",
+            (ip, today, DAILY_LIMIT),
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Дневной лимит ({DAILY_LIMIT} генераций) исчерпан. Он обновится завтра.",
+            )
+        used = conn.execute(
+            "SELECT count FROM ip_usage WHERE ip = ? AND date = ?", (ip, today)
+        ).fetchone()[0]
+    return DAILY_LIMIT - used
+
+
+def refund_quota(ip: str):
+    """Возвращает генерацию, если запрос к модели не удался."""
+    with db() as conn:
+        conn.execute(
+            "UPDATE ip_usage SET count = MAX(count - 1, 0) WHERE ip = ? AND date = ?",
+            (ip, date.today().isoformat()),
         )
 
-    conn.execute(
-        "INSERT INTO ip_usage (ip, date, count) VALUES (?, ?, 1) "
-        "ON CONFLICT(ip, date) DO UPDATE SET count = count + 1",
-        (ip, today),
-    )
-    conn.commit()
-    conn.close()
-    return limit - (used + 1)
 
-
-def get_remaining_quota(ip: str, limit: int) -> int:
-    """Только читает остаток лимита, не тратит его — для отображения в UI."""
-    today = str(date.today())
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT count FROM ip_usage WHERE ip = ? AND date = ?", (ip, today)
-    ).fetchone()
-    conn.close()
-    used = row[0] if row else 0
-    return max(0, limit - used)
-
-
-# Бесплатным доступно 1 уточнение у ИИ на карточку — привязываем лимит
-# к паре (IP, конкретный вопрос карточки), а не к аккаунту (аккаунтов
-# пока нет). Хэш вопроса используется как стабильный "ID карточки" без
-# необходимости менять структуру данных карточек.
-CLARIFY_FREE_LIMIT = 1
-
-
-def check_and_use_clarify(ip: str, card_question: str):
+def use_clarify(ip: str, card_question: str):
     key = ip + "|" + hashlib.sha256(card_question.encode("utf-8")).hexdigest()[:16]
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute("SELECT count FROM clarify_usage WHERE key = ?", (key,)).fetchone()
-    used = row[0] if row else 0
-
-    if used >= CLARIFY_FREE_LIMIT:
-        conn.close()
-        raise HTTPException(
-            status_code=429,
-            detail="В бесплатной версии доступно 1 уточнение на карточку. В PRO — без ограничений.",
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO clarify_usage (key, count) VALUES (?, 1) "
+            "ON CONFLICT(key) DO UPDATE SET count = count + 1 WHERE count < ?",
+            (key, CLARIFY_LIMIT),
         )
-
-    conn.execute(
-        "INSERT INTO clarify_usage (key, count) VALUES (?, 1) "
-        "ON CONFLICT(key) DO UPDATE SET count = count + 1",
-        (key,),
-    )
-    conn.commit()
-    conn.close()
+        if cur.rowcount == 0:
+            raise HTTPException(
+                status_code=429,
+                detail="К этой карточке уточнение уже использовано.",
+            )
 
 
-def get_gigachat_token() -> str:
+# ============================================================
+# GIGACHAT
+# ============================================================
+_session = requests.Session()
+_session.verify = VERIFY_SSL
+_token = {"value": None, "expires_at": 0.0}
+
+# Тариф GigaChat допускает 1 одновременный запрос. Блокирующие вызовы
+# уходят в поток (event loop не замирает), а Lock выстраивает их в очередь.
+_gigachat_lock = asyncio.Lock()
+
+
+def get_token() -> str:
     if not GIGACHAT_AUTH_KEY:
-        raise HTTPException(
-            status_code=500,
-            detail="GIGACHAT_AUTH_KEY не задан. Добавь его в .env файл.",
-        )
+        raise HTTPException(status_code=500, detail="GIGACHAT_AUTH_KEY не задан. Добавь его в .env файл.")
 
     now = time.time()
-    if _token_cache["access_token"] and _token_cache["expires_at"] > now + 5:
-        return _token_cache["access_token"]
-
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Accept": "application/json",
-        "RqUID": str(uuid.uuid4()),
-        "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
-    }
-    data = {"scope": GIGACHAT_SCOPE}
+    if _token["value"] and _token["expires_at"] > now + 5:
+        return _token["value"]
 
     try:
-        resp = requests.post(OAUTH_URL, headers=headers, data=data, verify=VERIFY_SSL, timeout=30)
+        resp = _session.post(
+            OAUTH_URL,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "RqUID": str(uuid.uuid4()),
+                "Authorization": f"Basic {GIGACHAT_AUTH_KEY}",
+            },
+            data={"scope": GIGACHAT_SCOPE},
+            timeout=30,
+        )
     except requests.exceptions.Timeout:
         raise HTTPException(status_code=504, detail="GigaChat не ответил за 30 секунд (получение токена). Попробуй ещё раз.")
     except requests.exceptions.ConnectionError:
-        raise HTTPException(status_code=502, detail="Не удалось подключиться к серверу GigaChat. Проверь интернет-соединение.")
+        raise HTTPException(status_code=502, detail="Не удалось подключиться к серверу GigaChat.")
 
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ошибка получения токена GigaChat: {resp.status_code} {resp.text}",
-        )
+        raise HTTPException(status_code=502, detail=f"Ошибка получения токена GigaChat: {resp.status_code}")
+
     payload = resp.json()
-    _token_cache["access_token"] = payload["access_token"]
-    expires_at_raw = payload.get("expires_at", 0)
-    _token_cache["expires_at"] = expires_at_raw / 1000 if expires_at_raw > 10**12 else now + 1700
-    return _token_cache["access_token"]
+    expires_raw = payload.get("expires_at", 0)
+    _token["value"] = payload["access_token"]
+    _token["expires_at"] = expires_raw / 1000 if expires_raw > 10**12 else now + 1700
+    return _token["value"]
 
 
-def ask_gigachat(prompt: str, model: str = "GigaChat", max_tokens: int = 8000, temperature: float = 0.3):
-    """Низкоуровневый запрос к конкретной модели GigaChat."""
-    token = get_gigachat_token()
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-    }
+def ask_gigachat(prompt: str, model: str, max_tokens: int, temperature: float = 0.3):
     body = {
         "model": model,
         "messages": [
@@ -320,165 +224,146 @@ def ask_gigachat(prompt: str, model: str = "GigaChat", max_tokens: int = 8000, t
         "temperature": temperature,
         "max_tokens": max_tokens,
     }
-
     try:
-        resp = requests.post(CHAT_URL, headers=headers, json=body, verify=VERIFY_SSL, timeout=60)
+        resp = _session.post(
+            CHAT_URL,
+            headers={"Accept": "application/json", "Authorization": f"Bearer {get_token()}"},
+            json=body,
+            timeout=60,
+        )
     except requests.exceptions.Timeout:
         raise HTTPException(
             status_code=504,
             detail="GigaChat не ответил за 60 секунд. Возможно, лекция слишком большая — попробуй сократить текст.",
         )
     except requests.exceptions.ConnectionError:
-        raise HTTPException(
-            status_code=502,
-            detail="Не удалось подключиться к серверу GigaChat. Проверь интернет-соединение и повтори попытку.",
-        )
+        raise HTTPException(status_code=502, detail="Не удалось подключиться к серверу GigaChat. Повтори попытку.")
 
-    # 402/429 обычно значит "закончился баланс токенов на эту модель"
-    if resp.status_code in (402, 429):
-        raise QuotaExceeded(f"Лимит токенов исчерпан для модели {model}: {resp.status_code} {resp.text}")
-
+    if resp.status_code in (402, 429):  # закончился баланс токенов модели
+        raise QuotaExceeded(model)
     if resp.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Ошибка запроса к GigaChat: {resp.status_code} {resp.text}",
-        )
-    data = resp.json()
-    choice = data["choices"][0]
-    content = choice["message"]["content"]
-    finish_reason = choice.get("finish_reason", "unknown")
-    return content, finish_reason
+        raise HTTPException(status_code=502, detail=f"Ошибка запроса к GigaChat: {resp.status_code}")
+
+    choice = resp.json()["choices"][0]
+    return choice["message"]["content"], choice.get("finish_reason", "unknown")
 
 
-def ask_gigachat_with_fallback(prompt: str, models: list[str], max_tokens: int = 8000, temperature: float = 0.3):
-    """Пробует модели по очереди из списка — если на текущей закончился
-    баланс токенов (QuotaExceeded), автоматически переходит к следующей.
-    Так лимит одной модели не останавливает работу приложения."""
-    last_error = None
+def ask_with_fallback(prompt: str, models: list[str], max_tokens: int):
     for model in models:
         try:
-            return ask_gigachat(prompt, model=model, max_tokens=max_tokens, temperature=temperature)
-        except QuotaExceeded as e:
-            last_error = e
+            return ask_gigachat(prompt, model, max_tokens)
+        except QuotaExceeded:
             continue
     raise HTTPException(
         status_code=402,
-        detail=f"Лимит токенов исчерпан на всех доступных моделях ({', '.join(models)}). {last_error}",
+        detail=f"Лимит токенов исчерпан на всех доступных моделях ({', '.join(models)}).",
     )
 
 
-def extract_json(raw_text: str, finish_reason: str = "unknown"):
-    """GigaChat иногда оборачивает ответ в ```json ... ``` — чистим и парсим.
-    Модель иногда путает формат и вместо массива [] возвращает объект {}
-    с ключами "0", "1", "2"... — приводим оба варианта к единому списку.
-    Если ответ обрезан по лимиту токенов, пытаемся восстановить хотя бы те
-    карточки, что успели прийти целиком, вместо полного отказа."""
-    cleaned = raw_text.strip()
-    cleaned = re.sub(r"^```(json)?", "", cleaned.strip())
-    cleaned = re.sub(r"```$", "", cleaned.strip())
-    cleaned = cleaned.strip()
+async def gigachat(prompt: str, models: list[str], max_tokens: int = 8000):
+    async with _gigachat_lock:
+        return await asyncio.to_thread(ask_with_fallback, prompt, models, max_tokens)
 
-    match = re.search(r"[\[{].*", cleaned, re.DOTALL)
-    if match:
-        cleaned = match.group(0)
 
-    opening_char = cleaned[:1]
-    closing_char = "]" if opening_char == "[" else "}"
+# ============================================================
+# РАЗБОР ОТВЕТА МОДЕЛИ
+# ============================================================
+def extract_json(raw: str, finish_reason: str = "unknown") -> list:
+    """Достаёт JSON из ответа: срезает ```-обёртку, чинит обрезанный ответ
+    (оставляя целые карточки) и приводит объект вида {"0":..., "1":...} к списку."""
+    text = re.sub(r"^```(?:json)?|```$", "", raw.strip()).strip()
+    match = re.search(r"[\[{].*", text, re.DOTALL)
+    if not match:
+        raise HTTPException(status_code=502, detail="Модель вернула пустой или нечитаемый ответ.")
+    text = match.group(0)
 
-    parsed = None
     try:
-        parsed = json.loads(cleaned, strict=False)
+        parsed = json.loads(text, strict=False)
     except json.JSONDecodeError:
-        last_complete = cleaned.rfind("}")
-        if last_complete == -1:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Модель вернула пустой или нечитаемый ответ. Сырой ответ: {raw_text[:500]}",
-            )
-        repaired = cleaned[: last_complete + 1] + closing_char
+        last = text.rfind("}")
+        closing = "]" if text[0] == "[" else "}"
         try:
-            parsed = json.loads(repaired, strict=False)
-        except json.JSONDecodeError as e:
-            if finish_reason == "length":
-                reason_hint = "Не хватило max_tokens — ответ обрезан по лимиту длины."
-            else:
-                reason_hint = f"Модель завершила ответ некорректно (finish_reason: {finish_reason})."
-            # Показываем именно то место, где сломался парсинг, а не всегда
-            # начало строки — так виднее реальная причина (например,
-            # неэкранированные кавычки внутри значения).
-            pos = e.pos if hasattr(e, "pos") else 0
-            window_start = max(0, pos - 150)
-            window_end = min(len(raw_text), pos + 150)
-            context = raw_text[window_start:window_end]
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Ответ от модели повреждён и не удалось восстановить: {e}. {reason_hint} "
-                    f"Фрагмент рядом с ошибкой: ...{context}..."
-                ),
+            if last == -1:
+                raise json.JSONDecodeError("no object", text, 0)
+            parsed = json.loads(text[: last + 1] + closing, strict=False)
+        except json.JSONDecodeError:
+            hint = (
+                "ответ обрезан по лимиту длины"
+                if finish_reason == "length"
+                else f"модель завершила ответ некорректно ({finish_reason})"
             )
+            raise HTTPException(status_code=502, detail=f"Не удалось разобрать ответ модели: {hint}. Попробуй ещё раз.")
 
-    # Модель вернула объект вместо массива — берём значения по порядку ключей
-    if isinstance(parsed, dict):
-        parsed = list(parsed.values())
+    return list(parsed.values()) if isinstance(parsed, dict) else parsed
 
-    return parsed
+
+def clean_cards(items) -> list[dict]:
+    """Приводит карточки к единому виду: только словари, поля — строки."""
+    cards = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        tags = item.get("tags") or []
+        if isinstance(tags, str):
+            tags = [tags]
+        cards.append({
+            "title": str(item.get("title") or "").strip(),
+            "question": str(item.get("question") or "").strip(),
+            "answer": str(item.get("answer") or "").strip(),
+            "tags": [str(t).strip() for t in tags if str(t).strip()][:3],
+        })
+    return cards
 
 
 # ============================================================
-# ИЗВЛЕЧЕНИЕ ТЕКСТА ИЗ ФАЙЛОВ
+# ТЕКСТ ИЗ ФАЙЛОВ (тяжёлые библиотеки грузим только когда нужны)
 # ============================================================
-def extract_text_from_upload(filename: str, content: bytes) -> str:
-    ext = os.path.splitext(filename)[1].lower()
-    text = ""
+def extract_text(filename: str, content: bytes) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
     stream = io.BytesIO(content)
 
     if ext in (".txt", ".md"):
-        text = content.decode("utf-8", errors="ignore")
-    elif ext == ".pdf":
-        reader = PdfReader(stream)
-        for page in reader.pages:
-            extracted = page.extract_text()
-            if extracted:
-                text += extracted + "\n"
-    elif ext == ".docx":
-        doc = Document(stream)
-        for para in doc.paragraphs:
-            if para.text.strip():
-                text += para.text + "\n"
-    elif ext == ".pptx":
-        prs = Presentation(stream)
-        for slide in prs.slides:
+        return content.decode("utf-8", errors="ignore")
+
+    if ext == ".pdf":
+        from pypdf import PdfReader
+        return "\n".join(filter(None, (p.extract_text() for p in PdfReader(stream).pages)))
+
+    if ext == ".docx":
+        from docx import Document
+        return "\n".join(p.text for p in Document(stream).paragraphs if p.text.strip())
+
+    if ext == ".pptx":
+        from pptx import Presentation
+        lines = []
+        for slide in Presentation(stream).slides:
             for shape in slide.shapes:
                 if shape.has_text_frame:
                     for para in shape.text_frame.paragraphs:
-                        p_text = "".join(run.text for run in para.runs)
-                        if p_text.strip():
-                            text += p_text + "\n"
-    else:
-        raise HTTPException(status_code=400, detail=f"Формат {ext} не поддерживается")
+                        line = "".join(run.text for run in para.runs)
+                        if line.strip():
+                            lines.append(line)
+        return "\n".join(lines)
 
-    return text
+    raise HTTPException(status_code=400, detail=f"Формат {ext or 'без расширения'} не поддерживается")
 
 
 # ============================================================
-# ПРОМПТ ДЛЯ ГЕНЕРАЦИИ КАРТОЧЕК
+# ПРОМПТЫ
 # ============================================================
-def build_prompt(source_text: str, level: str = "detailed") -> str:
-    trimmed = source_text[:MAX_INPUT_CHARS]
-
-    if level == "brief":
-        answer_instruction = 'краткий ответ (1 предложение, только суть)'
-    else:
-        answer_instruction = 'подробный ответ (2-4 предложения с пояснением)'
-
+def build_prompt(source_text: str, level: str) -> str:
+    answer = (
+        "краткий ответ (1 предложение, только суть)"
+        if level == "brief"
+        else "подробный ответ (2-4 предложения с пояснением)"
+    )
     return (
         "Преврати текст лекции ниже в набор обучающих карточек для повторения. "
         "Каждая карточка — это один ключевой факт, определение или концепция.\n\n"
         "Верни ТОЛЬКО JSON-массив объектов со следующими полями:\n"
         '- "title": короткий заголовок темы карточки (3-6 слов)\n'
         '- "question": вопрос для самопроверки\n'
-        f'- "answer": {answer_instruction}\n'
+        f'- "answer": {answer}\n'
         '- "tags": массив из 1-3 ключевых слов темы\n\n'
         "КРИТИЧЕСКИ ВАЖНО: верни строго валидный JSON-МАССИВ (начинается с "
         "символа [ и заканчивается символом ]), а НЕ объект с ключами-номерами "
@@ -492,25 +377,11 @@ def build_prompt(source_text: str, level: str = "detailed") -> str:
         "Не добавляй ничего, кроме самого JSON-массива. Не форматируй JSON "
         "с отступами и переносами строк — верни компактную запись в одну строку, "
         "это экономит место в ответе.\n\n"
-        f"Текст лекции:\n{trimmed}"
+        f"Текст лекции:\n{source_text[:MAX_INPUT_CHARS]}"
     )
 
 
-# ============================================================
-# FASTAPI ПРИЛОЖЕНИЕ
-# ============================================================
-app = FastAPI(title="Лекция -> Карточки")
-
-
-@app.on_event("startup")
-async def start_gigachat_dispatcher():
-    asyncio.create_task(_gigachat_dispatcher())
-
-
 def build_clarify_prompt(card_question: str, card_answer: str, user_question: str) -> str:
-    """Промпт для уточняющего вопроса по конкретной карточке. Даём модели
-    только контекст этой карточки (не всю лекцию) — так дешевле и быстрее,
-    а модель отвечает по существу, не расплываясь."""
     return (
         "Студент изучает карточку для повторения со следующим содержимым:\n"
         f"Вопрос карточки: {card_question}\n"
@@ -522,6 +393,75 @@ def build_clarify_prompt(card_question: str, card_answer: str, user_question: st
     )
 
 
+# ============================================================
+# ЭКСПОРТ
+# ============================================================
+def build_docx(cards: list[dict]) -> io.BytesIO:
+    from docx import Document
+
+    doc = Document()
+    doc.add_heading("Карточки для повторения", level=1)
+    for card in cards:
+        doc.add_heading(card["title"], level=2)
+        if card["tags"]:
+            doc.add_paragraph().add_run(" · ".join(card["tags"])).italic = True
+        doc.add_paragraph().add_run("Вопрос: " + card["question"]).bold = True
+        doc.add_paragraph("Ответ: " + card["answer"])
+        doc.add_paragraph("")
+
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def build_pdf(cards: list[dict]) -> io.BytesIO:
+    from fpdf import FPDF
+
+    pdf = FPDF()
+    pdf.add_page()
+    pdf.add_font("DejaVu", "", FONT_PATH)  # стандартные шрифты не знают кириллицу
+
+    def line(text, size, height):
+        pdf.set_font("DejaVu", size=size)
+        pdf.multi_cell(0, height, text, new_x="LMARGIN", new_y="NEXT")
+
+    line("Карточки для повторения", 16, 12)
+    pdf.ln(4)
+    for card in cards:
+        line(card["title"], 13, 8)
+        if card["tags"]:
+            line(" · ".join(card["tags"]), 10, 6)
+        line("Вопрос: " + card["question"], 11, 7)
+        line("Ответ: " + card["answer"], 11, 7)
+        pdf.ln(6)
+
+    return io.BytesIO(pdf.output())
+
+
+EXPORTERS = {
+    "docx": (build_docx, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+    "pdf": (build_pdf, "application/pdf"),
+}
+
+
+# ============================================================
+# ПРИЛОЖЕНИЕ
+# ============================================================
+app = FastAPI(title="Лекция -> Карточки")
+
+
+@app.get("/api/config")
+async def get_config(request: Request):
+    """Лимиты и остаток дневной квоты — одним запросом при загрузке страницы."""
+    return {
+        "max_input_chars": MAX_INPUT_CHARS,
+        "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
+        "quota_remaining": remaining_quota(client_ip(request)),
+        "quota_limit": DAILY_LIMIT,
+    }
+
+
 @app.post("/api/generate-cards")
 async def generate_cards(
     request: Request,
@@ -529,19 +469,15 @@ async def generate_cards(
     text: str | None = Form(default=None),
     level: str = Form(default="detailed"),
 ):
-    client_ip = get_client_ip(request)
-    user_is_premium = is_premium(request)
-    daily_limit = PRO_DAILY_LIMIT if user_is_premium else FREE_DAILY_LIMIT
-    remaining_after = check_and_use_quota(client_ip, daily_limit)
-
+    # Сначала проверяем вход — чтобы кривой файл не тратил лимит.
     if file is not None:
         content = await file.read()
         if len(content) > MAX_FILE_SIZE_BYTES:
             raise HTTPException(
                 status_code=413,
-                detail=f"Файл слишком большой (максимум {MAX_FILE_SIZE_BYTES // (1024*1024)} МБ)",
+                detail=f"Файл слишком большой (максимум {MAX_FILE_SIZE_BYTES // (1024 * 1024)} МБ)",
             )
-        source_text = extract_text_from_upload(file.filename, content)
+        source_text = await asyncio.to_thread(extract_text, file.filename, content)
     elif text and text.strip():
         source_text = text
     else:
@@ -550,235 +486,108 @@ async def generate_cards(
     if not source_text.strip():
         raise HTTPException(status_code=400, detail="Не удалось извлечь текст из файла")
 
-    was_truncated = len(source_text) > MAX_INPUT_CHARS
+    ip = client_ip(request)
+    remaining = use_quota(ip)
 
-    prompt = build_prompt(source_text, level=level)
-    async with gigachat_slot(user_is_premium):
-        raw_response, finish_reason = ask_gigachat_with_fallback(prompt, models=MODELS_FOR_CARDS)
-    cards = extract_json(raw_response, finish_reason)
+    try:
+        raw, finish_reason = await gigachat(build_prompt(source_text, level), MODELS_FOR_CARDS)
+        cards = clean_cards(extract_json(raw, finish_reason))
+        if not cards:
+            raise HTTPException(status_code=502, detail="Модель не вернула ни одной карточки. Попробуй ещё раз.")
+    except HTTPException:
+        refund_quota(ip)  # неудачная генерация не должна сжигать лимит
+        raise
 
-    # Автоматически сохраняем каждую генерацию в БД — это и есть основа
-    # истории: не нужно отдельного действия "сохранить", ссылка и запись
-    # в истории появляются сразу при генерации.
     set_id = secrets.token_urlsafe(5)
-    title = cards[0].get("title", "Карточки") if cards else "Карточки"
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO card_sets (id, cards_json, title, created_at) VALUES (?, ?, ?, ?)",
-        (set_id, json.dumps(cards, ensure_ascii=False), title, str(date.today())),
-    )
-    conn.commit()
-    conn.close()
+    title = cards[0]["title"] or "Карточки"
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO card_sets (id, cards_json, title, created_at) VALUES (?, ?, ?, ?)",
+            (set_id, json.dumps(cards, ensure_ascii=False), title, date.today().isoformat()),
+        )
 
-    today = str(date.today())
-    if _usage_stats["date"] != today:
-        _usage_stats["date"] = today
-        _usage_stats["count"] = 0
-    _usage_stats["count"] += 1
-
-    return JSONResponse({
+    return {
         "cards": cards,
-        "source_length": len(source_text),
-        "max_input_chars": MAX_INPUT_CHARS,
-        "was_truncated": was_truncated,
         "id": set_id,
         "url": f"/s/{set_id}",
         "title": title,
-        "quota_remaining": remaining_after,
-        "quota_limit": daily_limit,
-        "is_premium": user_is_premium,
-    })
-
-
-@app.get("/api/quota")
-async def get_quota(request: Request):
-    """Позволяет фронтенду показать остаток лимита до генерации, не тратя его."""
-    user_is_premium = is_premium(request)
-    daily_limit = PRO_DAILY_LIMIT if user_is_premium else FREE_DAILY_LIMIT
-    client_ip = get_client_ip(request)
-    remaining = get_remaining_quota(client_ip, daily_limit)
-    return JSONResponse({"remaining": remaining, "limit": daily_limit, "is_premium": user_is_premium})
-
-
-@app.get("/api/limits")
-async def get_limits():
-    return JSONResponse({
-        "max_input_chars": MAX_INPUT_CHARS,
-        "max_file_size_mb": MAX_FILE_SIZE_BYTES // (1024 * 1024),
-    })
-
-
-@app.get("/api/set/{set_id}")
-async def get_set(set_id: str):
-    conn = sqlite3.connect(DB_PATH)
-    row = conn.execute(
-        "SELECT cards_json, title FROM card_sets WHERE id = ?", (set_id,)
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Набор карточек не найден (возможно, ссылка устарела)")
-
-    cards_json, title = row
-    return JSONResponse({"cards": json.loads(cards_json), "title": title})
-
-
-@app.get("/s/{set_id}")
-async def view_shared_set(set_id: str):
-    return FileResponse(os.path.join("static", "shared.html"))
-
-
-@app.get("/api/stats")
-async def get_stats():
-    """Счётчик генераций за сегодня — пригодится, когда будешь вводить тарифы."""
-    today = str(date.today())
-    if _usage_stats["date"] != today:
-        return JSONResponse({"date": today, "count": 0})
-    return JSONResponse(_usage_stats)
+        "was_truncated": len(source_text) > MAX_INPUT_CHARS,
+        "quota_remaining": remaining,
+        "quota_limit": DAILY_LIMIT,
+    }
 
 
 @app.post("/api/clarify")
 async def clarify_card(request: Request, payload: dict = Body(...)):
-    """Отвечает на уточняющий вопрос студента по конкретной карточке."""
-    card_question = payload.get("card_question", "")
-    card_answer = payload.get("card_answer", "")
-    user_question = payload.get("user_question", "")
+    card_question = str(payload.get("card_question", ""))
+    card_answer = str(payload.get("card_answer", ""))
+    user_question = str(payload.get("user_question", "")).strip()
 
-    if not user_question.strip():
+    if not user_question:
         raise HTTPException(status_code=400, detail="Вопрос пустой")
+    if len(user_question) > 500:
+        raise HTTPException(status_code=400, detail="Вопрос слишком длинный (максимум 500 символов)")
 
-    user_is_premium = is_premium(request)
-    if not user_is_premium:
-        client_ip = get_client_ip(request)
-        check_and_use_clarify(client_ip, card_question)  # кидает 429, если лимит исчерпан
+    use_clarify(client_ip(request), card_question)
+    answer, _ = await gigachat(
+        build_clarify_prompt(card_question, card_answer, user_question),
+        MODELS_FOR_CLARIFY,
+        max_tokens=500,
+    )
+    return {"answer": answer.strip()}
 
-    prompt = build_clarify_prompt(card_question, card_answer, user_question)
-    async with gigachat_slot(user_is_premium):
-        answer_text, _ = ask_gigachat_with_fallback(
-            prompt, models=MODELS_FOR_CLARIFY, max_tokens=500
-        )
 
-    return JSONResponse({"answer": answer_text.strip()})
+@app.get("/api/set/{set_id}")
+async def get_set(set_id: str):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT cards_json, title FROM card_sets WHERE id = ?", (set_id,)
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Набор карточек не найден (возможно, ссылка устарела)")
+    return {"cards": json.loads(row[0]), "title": row[1]}
+
+
+@app.post("/api/export/{fmt}")
+async def export_cards(fmt: str, payload: dict = Body(...)):
+    if fmt not in EXPORTERS:
+        raise HTTPException(status_code=400, detail="Неизвестный формат (доступны: docx, pdf)")
+
+    cards = clean_cards(payload.get("cards"))[:MAX_EXPORT_CARDS]
+    if not cards:
+        raise HTTPException(status_code=400, detail="Нет карточек для экспорта")
+
+    build, media_type = EXPORTERS[fmt]
+    buffer = await asyncio.to_thread(build, cards)
+
+    # В HTTP-заголовке кириллицы быть не может: ASCII-имя + filename*=UTF-8''...
+    disposition = f'attachment; filename="cards.{fmt}"; filename*=UTF-8\'\'{quote("карточки." + fmt)}'
+    return StreamingResponse(buffer, media_type=media_type, headers={"Content-Disposition": disposition})
+
+
+# ---------------- страницы и статика ----------------
+@app.get("/")
+async def index_page():
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/s/{set_id}")
+async def shared_page(set_id: str):
+    return FileResponse(os.path.join(STATIC_DIR, "shared.html"))
 
 
 @app.get("/robots.txt")
 async def robots_txt():
-    return FileResponse(os.path.join("static", "robots.txt"), media_type="text/plain")
+    return FileResponse(os.path.join(BASE_DIR, "robots.txt"), media_type="text/plain")
 
 
 @app.get("/sitemap.xml")
 async def sitemap_xml():
-    return FileResponse(os.path.join("static", "sitemap.xml"), media_type="application/xml")
+    return FileResponse(os.path.join(BASE_DIR, "sitemap.xml"), media_type="application/xml")
 
 
-@app.post("/api/export/{fmt}")
-async def export_cards(fmt: str, request: Request, payload: dict = Body(...)):
-    """Экспорт набора карточек в docx или pdf — платная фича, доступна
-    только с валидным промокодом (см. is_premium)."""
-    if not is_premium(request):
-        raise HTTPException(
-            status_code=403,
-            detail="Экспорт в этот формат доступен только с промокодом безлимита.",
-        )
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-    cards = payload.get("cards", [])
-    if not cards:
-        raise HTTPException(status_code=400, detail="Нет карточек для экспорта")
-
-    if fmt == "docx":
-        buffer = build_docx(cards)
-        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        ascii_name, utf8_name = "cards.docx", "карточки.docx"
-    elif fmt == "pdf":
-        buffer = build_pdf(cards)
-        media_type = "application/pdf"
-        ascii_name, utf8_name = "cards.pdf", "карточки.pdf"
-    else:
-        raise HTTPException(status_code=400, detail="Неизвестный формат (доступны: docx, pdf)")
-
-    # HTTP-заголовки должны быть latin-1 — кириллицу напрямую в имя файла
-    # положить нельзя. Даём ASCII-имя как основное (filename=) и правильно
-    # закодированное кириллическое имя (filename*=UTF-8''...) для браузеров,
-    # которые его поддерживают — так скачается "карточки.pdf", а не "cards.pdf".
-    from urllib.parse import quote
-    content_disposition = (
-        f'attachment; filename="{ascii_name}"; '
-        f"filename*=UTF-8''{quote(utf8_name)}"
-    )
-
-    return StreamingResponse(
-        buffer,
-        media_type=media_type,
-        headers={"Content-Disposition": content_disposition},
-    )
-
-
-def build_docx(cards: list) -> io.BytesIO:
-    doc = Document()
-    title = doc.add_heading("Карточки для повторения", level=1)
-
-    for card in cards:
-        doc.add_heading(card.get("title", ""), level=2)
-        p_tags = doc.add_paragraph()
-        p_tags.add_run(" · ".join(card.get("tags", []))).italic = True
-
-        p_q = doc.add_paragraph()
-        run_q = p_q.add_run("Вопрос: " + card.get("question", ""))
-        run_q.bold = True
-
-        doc.add_paragraph("Ответ: " + card.get("answer", ""))
-        doc.add_paragraph("")  # пустая строка между карточками
-
-    buffer = io.BytesIO()
-    doc.save(buffer)
-    buffer.seek(0)
-    return buffer
-
-
-FONT_PATH = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans.ttf")
-
-
-def build_pdf(cards: list) -> io.BytesIO:
-    pdf = FPDF()
-    pdf.add_page()
-    # Стандартные PDF-шрифты не поддерживают кириллицу — подключаем
-    # DejaVu Sans, у которого есть нужные символы.
-    pdf.add_font("DejaVu", "", FONT_PATH)
-    pdf.set_font("DejaVu", size=16)
-    pdf.cell(0, 12, "Карточки для повторения", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
-
-    for card in cards:
-        pdf.set_font("DejaVu", size=13)
-        pdf.multi_cell(0, 8, card.get("title", ""), new_x="LMARGIN", new_y="NEXT")
-
-        pdf.set_font("DejaVu", size=10)
-        tags = " · ".join(card.get("tags", []))
-        if tags:
-            pdf.multi_cell(0, 6, tags, new_x="LMARGIN", new_y="NEXT")
-
-        pdf.set_font("DejaVu", size=11)
-        pdf.multi_cell(0, 7, "Вопрос: " + card.get("question", ""), new_x="LMARGIN", new_y="NEXT")
-        pdf.multi_cell(0, 7, "Ответ: " + card.get("answer", ""), new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(6)
-
-    buffer = io.BytesIO(pdf.output())
-    buffer.seek(0)
-    return buffer
-
-
-@app.get("/")
-async def root():
-    return FileResponse(os.path.join("static", "index.html"))
-
-
-
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# Общий механизм для файлов подтверждения владения сайтом (Яндекс.Вебмастер,
-# Google Search Console и т.п.) — все они требуют файл именно в корне сайта
-# (https://сайт/имя_файла.html), а не в /static/. Вместо того чтобы каждый
-# раз добавлять новый @app.get(...) под конкретное имя файла — просто
-# кладёшь файл в папку verify/ рядом с app.py, и он автоматически станет
-# доступен в корне сайта под тем же именем.
-app.mount("/", StaticFiles(directory="verify"), name="verify")
+# Файлы подтверждения владения сайтом (Яндекс.Вебмастер, Google Search Console)
+# должны лежать в корне сайта. Кладёшь файл в verify/ — он доступен как /имя_файла.
+app.mount("/", StaticFiles(directory=VERIFY_DIR, check_dir=False), name="verify")

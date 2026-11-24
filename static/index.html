@@ -3,154 +3,91 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Nauticards — Лекция в карточки для повторения за секунды</title>
-<meta name="description" content="Загрузи файл лекции (txt, pdf, docx, pptx) или вставь текст — ИИ разложит материал на карточки для быстрого повторения перед экзаменом." />
-<meta name="keywords" content="карточки для учёбы, конспект в карточки, ИИ для студентов, flashcards, подготовка к экзамену" />
-<meta property="og:title" content="Nauticards — Лекция в карточки" />
-<meta property="og:description" content="ИИ превращает текст лекции в карточки для повторения" />
+<title>Conspector — Лекция в карточки для повторения за секунды</title>
+<meta name="description" content="Загрузи файл лекции (txt, pdf, docx, pptx) или вставь текст — материал будет разложен на карточки для быстрого повторения перед экзаменом." />
+<meta name="keywords" content="карточки для учёбы, конспект в карточки, flashcards, подготовка к экзамену" />
+<meta property="og:title" content="Conspector — Лекция в карточки" />
+<meta property="og:description" content="Текст лекции превращается в карточки для повторения" />
 <meta property="og:type" content="website" />
-
-<!-- Подтверждение владения сайтом — вставь сюда content, который выдадут
-     Яндекс.Вебмастер и Google Search Console после добавления сайта -->
-<meta name="yandex-verification" content="вставь-код-от-яндекса" />
-<meta name="google-site-verification" content="вставь-код-от-google" />
-<link rel="stylesheet" href="/static/style.css?v=10" />
+<meta name="color-scheme" content="light dark" />
+<link rel="stylesheet" href="/static/style.css?v=11" />
 </head>
 <body>
+<div class="wrap">
 
-<header>
-  <div class="eyebrow">Конспект → Карточка</div>
-  <h1>Лекция за пару секунд<br>в набор <span>карточек</span></h1>
-  <p>Загрузи файл лекции (.txt, .pdf, .docx, .pptx) или вставь текст — модель разложит его на карточки для повторения.</p>
-</header>
+  <header class="site-head">
+    <a class="brand" href="/">Conspector</a>
+    <h1>Лекция за пару секунд — в набор карточек</h1>
+    <p class="lead">Загрузи файл лекции (.txt, .pdf, .docx, .pptx) или вставь текст — получишь карточки «вопрос — ответ» для повторения.</p>
+  </header>
 
-<div class="panel">
-  <div class="tabs">
-    <button class="tab-btn active" data-tab="file">Файл</button>
-    <button class="tab-btn" data-tab="text">Текст</button>
-  </div>
-  <div class="limit-hint" id="limitHint">До 15 000 символов текста или файл до 10 МБ</div>
-  <div class="quota-hint" id="quotaHint"></div>
-
-  <div class="tab-content active" id="tab-file">
-    <label class="file-drop" id="fileDrop" for="fileInput">
-      <span class="drop-icon">📎</span>
-      <span>Перетащи файл сюда или нажми, чтобы выбрать</span>
-      <span style="font-size:11px; opacity:.7">.txt, .pdf, .docx, .pptx</span>
-    </label>
-    <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx,.pptx" style="display:none" />
-  </div>
-
-  <div class="tab-content" id="tab-text">
-    <textarea id="textInput" placeholder="Вставь текст лекции сюда..."></textarea>
-    <div class="char-counter" id="charCounter">0 символов</div>
-  </div>
-
-  <div class="level-toggle">
-    <button class="level-btn" data-level="brief">Кратко</button>
-    <button class="level-btn active" data-level="detailed">Подробно</button>
-  </div>
-
-  <button class="submit" id="submitBtn">
-    <span class="spinner"></span>
-    <span id="submitText">Превратить в карточки</span>
-  </button>
-</div>
-
-<div class="status" id="status"></div>
-<div class="share-box" id="shareBox" style="display:none">
-  <div class="share-actions">
-    <button class="share-btn" id="shareBtn">🔗 Поделиться ссылкой</button>
-    <button class="download-btn" id="downloadBtn">⬇️ Скачать .txt</button>
-    <button class="download-btn premium-only" id="downloadDocxBtn" style="display:none">📄 .docx</button>
-    <button class="download-btn premium-only" id="downloadPdfBtn" style="display:none">📕 .pdf</button>
-  </div>
-  <div class="share-link-row" id="shareLinkRow" style="display:none">
-    <input type="text" id="shareLinkInput" readonly />
-    <button id="copyLinkBtn">Копировать</button>
-  </div>
-</div>
-
-<div class="history-wrap">
-  <button class="history-btn" id="historyBtn">🕘 История (<span id="historyCount">0</span>)</button>
-  <button class="history-btn theme-open-btn" id="themeOpenBtn" style="display:none">🎨 Оформление</button>
-</div>
-
-<div class="modal-overlay" id="pricingModal" style="display:none">
-  <div class="modal-box">
-    <button class="modal-close" id="pricingModalClose">✕</button>
-    <h3>Тарифы</h3>
-    <p class="history-note">Пока в разработке — напиши, если хочешь попасть в число первых с доступом.</p>
-    <div class="pricing-list">
-      <div class="pricing-card">
-        <div class="pricing-name">Free</div>
-        <div class="pricing-price">0₽</div>
-        <ul>
-          <li>5 генераций в день</li>
-          <li>1 уточнение у ИИ на карточку</li>
-          <li>Копирование, история, ссылки</li>
-          <li>До 15 000 символов / файл до 10 МБ</li>
-        </ul>
+  <main>
+    <section class="panel">
+      <div class="seg tabs" id="tabs">
+        <button type="button" class="active" data-value="file" aria-pressed="true">Файл</button>
+        <button type="button" data-value="text" aria-pressed="false">Текст</button>
       </div>
-      <div class="pricing-card featured">
-        <div class="pricing-name">Pro</div>
-        <div class="pricing-price">200₽<span>/мес</span></div>
-        <ul>
-          <li>30 генераций в день</li>
-          <li>Безлимит уточнений у ИИ</li>
-          <li>Гибкая кастомизация оформления</li>
-          <li>Экспорт в PDF, DOCX, TXT</li>
-          <li>Приоритетная обработка запросов</li>
-        </ul>
+      <p class="hint" id="limitHint">До 15 000 символов текста или файл до 10 МБ</p>
+      <p class="quota" id="quotaHint"></p>
+
+      <div id="tab-file">
+        <label class="file-drop" id="fileDrop" for="fileInput">
+          <span id="dropLabel">Перетащи файл сюда или нажми, чтобы выбрать</span>
+          <small>.txt, .pdf, .docx, .pptx</small>
+        </label>
+        <input type="file" id="fileInput" accept=".txt,.md,.pdf,.docx,.pptx" hidden />
+      </div>
+
+      <div id="tab-text" hidden>
+        <textarea id="textInput" placeholder="Вставь текст лекции сюда…"></textarea>
+        <div class="counter" id="charCounter">0 символов</div>
+      </div>
+
+      <div class="seg level" id="levelToggle">
+        <button type="button" data-value="brief" aria-pressed="false">Кратко</button>
+        <button type="button" class="active" data-value="detailed" aria-pressed="true">Подробно</button>
+      </div>
+
+      <button type="button" class="btn-primary" id="submitBtn">
+        <span class="spinner"></span>
+        <span id="submitText">Превратить в карточки</span>
+      </button>
+    </section>
+
+    <p class="status" id="status" role="status"></p>
+
+    <div id="results" hidden>
+      <div class="actions">
+        <button type="button" class="btn" id="shareBtn">Поделиться ссылкой</button>
+        <button type="button" class="btn" id="downloadTxtBtn">Скачать .txt</button>
+        <button type="button" class="btn" id="downloadDocxBtn">Скачать .docx</button>
+        <button type="button" class="btn" id="downloadPdfBtn">Скачать .pdf</button>
+      </div>
+      <div class="share-row" id="shareRow" hidden>
+        <input type="text" id="shareLinkInput" readonly aria-label="Ссылка на набор" />
+        <button type="button" class="btn" id="copyLinkBtn">Копировать</button>
       </div>
     </div>
-    <a href="https://t.me/NAuticards" target="_blank" rel="noopener" class="pricing-cta">Написать разработчику</a>
 
-    <div class="promo-row">
-      <input type="text" id="promoInput" placeholder="Есть промокод? Введи сюда" />
-      <button id="promoSaveBtn">Активировать</button>
-    </div>
-    <div class="promo-status" id="promoStatus"></div>
-  </div>
-</div>
+    <div id="cards"></div>
+    <p class="empty" id="emptyHint">Здесь появятся карточки после генерации.</p>
+  </main>
 
-<div class="modal-overlay" id="themeModal" style="display:none">
-  <div class="modal-box">
-    <button class="modal-close" id="themeModalClose">✕</button>
-    <h3>Оформление карточек</h3>
-    <p class="history-note">Доступно с промокодом безлимита.</p>
-    <div class="theme-swatches" id="themeSwatches">
-      <button class="swatch" data-coral="#FF4D5E" data-mint="#3DDC97" style="background: linear-gradient(135deg,#FF4D5E,#3DDC97)" title="По умолчанию"></button>
-      <button class="swatch" data-coral="#7C86FF" data-mint="#3DDC97" style="background: linear-gradient(135deg,#7C86FF,#3DDC97)" title="Индиго/мята"></button>
-      <button class="swatch" data-coral="#FF9F45" data-mint="#3DDC97" style="background: linear-gradient(135deg,#FF9F45,#3DDC97)" title="Янтарь/мята"></button>
-      <button class="swatch" data-coral="#FF4D5E" data-mint="#C99A3A" style="background: linear-gradient(135deg,#FF4D5E,#C99A3A)" title="Коралл/золото"></button>
-      <button class="swatch" data-coral="#E354D9" data-mint="#3DDC97" style="background: linear-gradient(135deg,#E354D9,#3DDC97)" title="Фуксия/мята"></button>
-    </div>
-  </div>
-</div>
+  <footer class="foot">
+    <button type="button" class="link" id="historyBtn">История (<span id="historyCount">0</span>)</button>
+    <a href="https://github.com/Ocean-Nautilus/NAuticards" target="_blank" rel="noopener">Исходный код на GitHub</a>
+  </footer>
 
-<div class="modal-overlay" id="historyModal" style="display:none">
-  <div class="modal-box">
-    <button class="modal-close" id="historyModalClose">✕</button>
+  <dialog id="historyDialog">
+    <button type="button" class="dialog-close" id="historyClose" aria-label="Закрыть">×</button>
     <h3>История генераций</h3>
-    <p class="history-note">Хранится в этом браузере. На другом устройстве не видна.</p>
-    <div id="historyList" class="history-list"></div>
-    <button class="clear-history-btn" id="clearHistoryBtn">Очистить историю</button>
-  </div>
+    <p class="hint">Хранится в этом браузере. На другом устройстве не видна.</p>
+    <div class="history-list" id="historyList"></div>
+    <button type="button" class="link danger" id="clearHistoryBtn">Очистить историю</button>
+  </dialog>
+
 </div>
-
-<div id="cards"></div>
-<p class="empty-hint" id="emptyHint">Здесь появятся карточки после генерации.</p>
-
-<footer class="dev-footer">
-  <a href="https://github.com/твой-username" target="_blank" rel="noopener">
-    <svg class="gh-icon" viewBox="0 0 16 16" width="16" height="16" fill="currentColor">
-      <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/>
-    </svg>
-    Разработчик на GitHub
-  </a>
-</footer>
-
-<script src="/static/script.js?v=9"></script>
+<script src="/static/common.js?v=11"></script>
+<script src="/static/script.js?v=11"></script>
 </body>
 </html>
