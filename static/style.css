@@ -45,7 +45,7 @@ body{
 .wrap{ max-width: 920px; margin: 0 auto; }
 
 /* ---------- шапка ---------- */
-.site-head{ max-width: 640px; margin: 0 0 32px; }
+.site-head{ max-width: 640px; margin: 0 auto 32px; text-align: center; }
 
 .brand{
   display: inline-block;
@@ -66,7 +66,7 @@ h1{
 /* ---------- форма ---------- */
 .panel{
   max-width: 640px;
-  margin: 0 0 24px;
+  margin: 0 auto 24px;
   padding: 24px;
   background: var(--surface);
   border: 1px solid var(--line);
@@ -202,12 +202,12 @@ textarea::placeholder, input::placeholder{ color: var(--muted); }
 @keyframes spin{ to{ transform: rotate(360deg); } }
 
 /* ---------- статус и действия ---------- */
-.status{ min-height: 20px; margin: 0 0 16px; font-size: 13px; color: var(--accent); }
+.status{ min-height: 20px; margin: 0 0 16px; text-align: center; font-size: 13px; color: var(--accent); }
 .status.error{ color: var(--err); }
 
-.actions{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+.actions{ display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-bottom: 16px; }
 
-.share-row{ display: flex; gap: 8px; max-width: 460px; margin-bottom: 20px; }
+.share-row{ display: flex; gap: 8px; max-width: 460px; margin: 0 auto 20px; }
 
 .share-row input, .clarify input{
   flex: 1;
@@ -288,10 +288,10 @@ textarea::placeholder, input::placeholder{ color: var(--muted); }
 .clarify .cq{ color: var(--accent); font-weight: 600; font-size: 13px; }
 .clarify .ca{ font-size: 13px; }
 
-.empty{ max-width: 400px; margin: 24px 0; color: var(--muted); font-size: 14px; }
+.empty{ max-width: 400px; margin: 24px auto; text-align: center; color: var(--muted); font-size: 14px; }
 
 /* ---------- подвал ---------- */
-.foot{ display: flex; flex-wrap: wrap; gap: 16px; margin-top: 56px; }
+.foot{ display: flex; flex-wrap: wrap; justify-content: center; gap: 16px; margin-top: 56px; }
 
 .foot a{ color: var(--muted); font-size: 13px; text-decoration: none; }
 .foot a:hover{ color: var(--accent); text-decoration: underline; }
